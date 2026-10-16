@@ -131,11 +131,13 @@ public final class VoiceAgentViewModel {
     public func startListening() {
         activeTask?.cancel()
         errorMessage = nil
+        state = .listening
         
         activeTask = Task {
             do {
                 try await audioRecorder.start()
-                state = .listening
+            } catch is CancellationError {
+                // Cancelled due to rapid stop or reset - do not show error banner
             } catch {
                 self.errorMessage = error.localizedDescription
                 self.state = .idle
@@ -177,9 +179,7 @@ public final class VoiceAgentViewModel {
     public func reset() {
         activeTask?.cancel()
         activeTask = nil
-        if audioRecorder.isRecording {
-            _ = audioRecorder.stop()
-        }
+        _ = audioRecorder.stop()
         ttsClient.stop()
         audioLevel = 0.0
         state = .idle

@@ -206,7 +206,7 @@ struct ContentView: View {
         VStack(spacing: 20) {
             // Animated level meter while listening
             audioLevelMeter
-                .frame(height: 40)
+                .frame(height: 64)
                 .padding(.top, 8)
             
             // Large Mic Button
@@ -229,7 +229,7 @@ struct ContentView: View {
                     .frame(width: 6, height: height)
             }
         }
-        .frame(height: 40)
+        .frame(height: 64)
         .animation(.easeInOut(duration: 0.1), value: viewModel.audioLevel)
         .opacity(viewModel.state == .listening ? 1.0 : 0.3)
     }
@@ -241,7 +241,7 @@ struct ContentView: View {
         let falloff = max(0.45, 1.0 - (distanceFromCenter * 0.14))
         let level = Double(viewModel.audioLevel)
         let minHeight: CGFloat = 6.0
-        let maxHeight: CGFloat = 36.0
+        let maxHeight: CGFloat = 60.0
         let dynamicHeight = minHeight + CGFloat(level * falloff) * (maxHeight - minHeight)
         return min(maxHeight, max(minHeight, dynamicHeight))
     }

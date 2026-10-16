@@ -41,11 +41,23 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
     @ObservationIgnored
     public var onLevelChange: (@MainActor @Sendable (Float) -> Void)?
     
-    private var audioEngine: AVAudioEngine?
+    // MARK: - Concurrency & Synchronization
+    
+    /// Dedicated serial queue for all AVAudioSession configuration, setActive calls,
+    /// and AVAudioEngine start/stop operations to avoid main thread hang risk.
+    private let audioQueue = DispatchQueue(label: "com.vaani.AudioRecorder.audioQueue", qos: .userInitiated)
+    
     private let lock = NSLock()
     private var recordedSamples: [Float] = []
     private var smoothedLevel: Float = 0.0
     private var bufferCount: Int = 0
+    private var minDB: Float = .greatestFiniteMagnitude
+    private var maxDB: Float = -.greatestFiniteMagnitude
+    
+    // Engine lifecycle state - accessed strictly on audioQueue
+    private var audioEngine: AVAudioEngine?
+    private var hasInstalledTap: Bool = false
+    private var isEngineActive: Bool = false
     
     // MARK: - Initialization
     
@@ -61,21 +73,49 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
     
     // MARK: - Recording Control
     
-    /// Requests permission, configures AVAudioSession, and starts audio recording.
+    /// Requests permission, configures AVAudioSession, and starts audio recording off the main thread.
     public func start() async throws {
         let granted = await requestRecordPermission()
         guard granted else {
             throw AudioRecorderError.permissionDenied
         }
         
-        try startRecording()
+        try Task.checkCancellation()
+        
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                audioQueue.async { [weak self] in
+                    guard let self = self else {
+                        continuation.resume()
+                        return
+                    }
+                    do {
+                        try self.performStart()
+                        continuation.resume()
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: { [weak self] in
+            self?.audioQueue.async {
+                self?.performStop()
+            }
+        }
+        
+        if Task.isCancelled {
+            audioQueue.async { [weak self] in
+                self?.performStop()
+            }
+            throw CancellationError()
+        }
     }
     
     /// Configures audio session and begins capturing microphone input into mono 16 kHz Float32 samples.
-    public func startRecording() throws {
-        // Stop any running instance
-        if isRecording {
-            _ = stop()
+    /// Runs exclusively on audioQueue off the main thread.
+    private func performStart() throws {
+        if isEngineActive || audioEngine != nil {
+            performStop()
         }
         
         #if os(iOS) || os(visionOS)
@@ -112,9 +152,15 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
         recordedSamples.removeAll()
         smoothedLevel = 0.0
         bufferCount = 0
+        minDB = .greatestFiniteMagnitude
+        maxDB = -.greatestFiniteMagnitude
         lock.unlock()
         
-        inputNode.removeTap(onBus: 0)
+        if hasInstalledTap {
+            inputNode.removeTap(onBus: 0)
+            hasInstalledTap = false
+        }
+        
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             guard let self = self else { return }
             
@@ -138,20 +184,35 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
             // Convert to dB: 20 * log10(max(rms, 0.00001))
             let dB = 20.0 * log10(max(rms, 0.00001))
             
-            // Normalize: clamp((dB + 50) / 50, 0, 1)
-            let rawLevel = min(max((dB + 50.0) / 50.0, 0.0), 1.0)
+            // Normalize: dB range -55 to -20: level = clamp((dB + 55) / 35, 0, 1), then curve: level = pow(level, 0.6)
+            let clamped = min(max((dB + 55.0) / 35.0, 0.0), 1.0)
+            let rawLevel = pow(clamped, 0.6)
             
-            // Light smoothing: 0.3 new + 0.7 old
+            // Smoothing: fast attack (0.7 new + 0.3 old), slower release (0.2 new + 0.8 old)
             self.lock.lock()
-            self.smoothedLevel = (0.3 * rawLevel) + (0.7 * self.smoothedLevel)
-            let currentLevel = self.smoothedLevel
+            let oldLevel = self.smoothedLevel
+            let smoothed: Float
+            if rawLevel > oldLevel {
+                smoothed = (0.7 * rawLevel) + (0.3 * oldLevel)
+            } else {
+                smoothed = (0.2 * rawLevel) + (0.8 * oldLevel)
+            }
+            self.smoothedLevel = smoothed
+            let currentLevel = smoothed
+            
+            // Track min and max dB seen so far for calibration
+            if dB < self.minDB { self.minDB = dB }
+            if dB > self.maxDB { self.maxDB = dB }
+            let currentMinDB = self.minDB
+            let currentMaxDB = self.maxDB
+            
             self.bufferCount += 1
             let count = self.bufferCount
             self.lock.unlock()
             
-            // DEBUG: Temporary print of RMS and dB value every ~10 buffers for Xcode console verification
+            // DEBUG: Print RMS, dB, min/max dB, and level every ~10 buffers for calibration
             if count % 10 == 0 {
-                print(String(format: "[AudioRecorder DEBUG] buffer #%d | RMS: %.5f | dB: %.2f | Level: %.3f", count, rms, dB, currentLevel))
+                print(String(format: "[AudioRecorder DEBUG] buffer #%d | RMS: %.5f | dB: %.2f (min: %.2f, max: %.2f) | Level: %.3f", count, rms, dB, currentMinDB, currentMaxDB, currentLevel))
             }
             
             // Dispatch level update to MainActor so @Observable view model refreshes UI
@@ -193,38 +254,70 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
                 }
             }
         }
+        hasInstalledTap = true
         
         do {
             try engine.start()
             self.audioEngine = engine
+            self.isEngineActive = true
             Task { @MainActor [weak self] in
                 self?.isRecording = true
             }
         } catch {
-            inputNode.removeTap(onBus: 0)
+            if hasInstalledTap {
+                inputNode.removeTap(onBus: 0)
+                hasInstalledTap = false
+            }
+            #if os(iOS) || os(visionOS)
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            #endif
             throw AudioRecorderError.engineStartFailed(error)
         }
     }
     
-    /// Stops recording and returns accumulated mono 16 kHz Float32 samples.
-    @discardableResult
-    public func stop() -> [Float] {
+    /// Tears down the audio engine and deactivates AVAudioSession off the main thread.
+    /// Runs exclusively on audioQueue.
+    private func performStop() {
+        guard isEngineActive || audioEngine != nil else { return }
+        
         if let engine = audioEngine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
+            if hasInstalledTap {
+                engine.inputNode.removeTap(onBus: 0)
+                hasInstalledTap = false
+            }
+            if engine.isRunning {
+                engine.stop()
+            }
             self.audioEngine = nil
         }
         
         #if os(iOS) || os(visionOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+            print("[AudioRecorder DEBUG] AVAudioSession setActive(false) failed: \(error)")
+        }
         #endif
         
+        self.isEngineActive = false
+    }
+    
+    /// Stops recording and returns accumulated mono 16 kHz Float32 samples.
+    /// Engine teardown and AVAudioSession deactivation execute asynchronously on audioQueue off the main thread.
+    @discardableResult
+    public func stop() -> [Float] {
         lock.lock()
         let samples = recordedSamples
         recordedSamples.removeAll()
         smoothedLevel = 0.0
         bufferCount = 0
+        minDB = .greatestFiniteMagnitude
+        maxDB = -.greatestFiniteMagnitude
         lock.unlock()
+        
+        audioQueue.async { [weak self] in
+            self?.performStop()
+        }
         
         Task { @MainActor [weak self] in
             guard let self = self else { return }
