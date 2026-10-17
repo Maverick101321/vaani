@@ -81,6 +81,13 @@ public final class VoiceAgentViewModel {
     
     /// Optional error description for user-facing alerts or banners.
     public var errorMessage: String?
+
+    /// Download/load lifecycle for the on-device WhisperKit model.
+    public var sttLoadingState: STTLoadingState = .loading
+
+    public var isSTTReady: Bool {
+        sttLoadingState == .ready
+    }
     
     // MARK: - Dependencies & Private State
     
@@ -98,7 +105,7 @@ public final class VoiceAgentViewModel {
     
     public init(
         audioRecorder: AudioRecorder = AudioRecorder(),
-        sttClient: SpeechToText = MockSpeechToText(),
+        sttClient: SpeechToText = WhisperKitSTT(),
         llmClient: LLMClient = MockLLMClient(),
         ttsClient: TextToSpeech = MockTextToSpeech()
     ) {
@@ -111,12 +118,36 @@ public final class VoiceAgentViewModel {
         audioRecorder.onLevelChange = { [weak self] level in
             self?.audioLevel = level
         }
+
+        if !(sttClient is WhisperKitSTT) {
+            sttLoadingState = .ready
+        }
+    }
+
+    /// Starts model setup once the app UI has appeared.
+    public func prepareSpeechToText() {
+        guard let whisperSTT = sttClient as? WhisperKitSTT, !isSTTReady else { return }
+
+        Task { [weak self] in
+            do {
+                try await whisperSTT.prepare { [weak self] loadingState in
+                    self?.sttLoadingState = loadingState
+                    if case .failed(let message) = loadingState {
+                        self?.errorMessage = message
+                    }
+                }
+            } catch {
+                // The state callback already contains a concise user-facing failure reason.
+                print("WhisperKit model preparation error: \(error)")
+            }
+        }
     }
     
     // MARK: - Voice Pipeline Controls
     
     /// Toggles listening state on/off.
     public func toggleListening() {
+        guard isSTTReady else { return }
         if state == .listening {
             stopListening()
         } else if state == .idle {
@@ -192,7 +223,6 @@ public final class VoiceAgentViewModel {
     /// - Returns: Recognized transcript string.
     @discardableResult
     public func transcribe(samples: [Float]? = nil) async -> String {
-        // TODO: Replace stub with production STT implementation (e.g. WhisperKit, Apple Speech, or API)
         state = .transcribing
         let start = ContinuousClock.now
         
@@ -202,9 +232,8 @@ public final class VoiceAgentViewModel {
             recognized = try await sttClient.transcribe(audioSamples: audio, language: language)
         } catch {
             print("STT transcription error: \(error)")
-            recognized = (language == .english)
-                ? "What is the weather today?"
-                : "Aaj mausam kaisa hai?"
+            errorMessage = error.localizedDescription
+            recognized = ""
         }
         
         let elapsed = ContinuousClock.now - start

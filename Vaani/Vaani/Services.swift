@@ -123,22 +123,22 @@ nonisolated public final class MockTextToSpeech: TextToSpeech, @unchecked Sendab
     }
 
     public nonisolated func speak(text: String, language: VoiceAgentViewModel.Language) async throws {
-        lock.lock()
-        _isSpeaking = true
-        lock.unlock()
+        setSpeaking(true)
         
         if simulatedDuration > 0 {
             try await Task.sleep(nanoseconds: UInt64(simulatedDuration * 1_000_000_000))
         }
         
-        lock.lock()
-        _isSpeaking = false
-        lock.unlock()
+        setSpeaking(false)
     }
 
     public nonisolated func stop() {
+        setSpeaking(false)
+    }
+
+    private nonisolated func setSpeaking(_ isSpeaking: Bool) {
         lock.lock()
-        _isSpeaking = false
+        _isSpeaking = isSpeaking
         lock.unlock()
     }
 }

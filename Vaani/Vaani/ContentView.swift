@@ -12,6 +12,8 @@ struct ContentView: View {
                     
                     // MARK: - Current State Indicator
                     stateBadge
+
+                    sttLoadingBadge
                     
                     // MARK: - Cards (Transcript & Response)
                     cardsSection
@@ -32,6 +34,9 @@ struct ContentView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Vaani")
             .navigationBarTitleDisplayMode(.inline)
+        }
+        .task {
+            viewModel.prepareSpeechToText()
         }
     }
     
@@ -92,6 +97,25 @@ struct ContentView: View {
         case .speaking:
             return .green
         }
+    }
+
+    private var sttLoadingBadge: some View {
+        HStack(spacing: 8) {
+            if !viewModel.isSTTReady {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
+
+            Text(viewModel.sttLoadingState.displayName)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(viewModel.isSTTReady ? .green : .secondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
     }
     
     // MARK: - Cards
@@ -271,6 +295,8 @@ struct ContentView: View {
             }
         }
         .buttonStyle(.plain)
+        .disabled(!viewModel.isSTTReady && viewModel.state != .listening)
+        .opacity(!viewModel.isSTTReady && viewModel.state != .listening ? 0.45 : 1.0)
         .accessibilityLabel(viewModel.state == .listening ? "Stop listening" : "Start listening")
     }
     
