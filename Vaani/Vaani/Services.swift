@@ -16,6 +16,69 @@ public extension SpeechToText {
     }
 }
 
+/// Role of a message in a multi-turn LLM conversation.
+nonisolated public enum LLMMessageRole: String, Sendable, Equatable {
+    case system
+    case user
+    case assistant
+    case tool
+}
+
+/// A message item in a conversation or tool-calling turn.
+nonisolated public struct LLMChatMessage: Sendable, Equatable {
+    public let role: LLMMessageRole
+    public let content: String
+    public let toolCalls: [LLMToolCall]
+    public let toolCallId: String?
+    public let toolName: String?
+
+    public init(
+        role: LLMMessageRole,
+        content: String,
+        toolCalls: [LLMToolCall] = [],
+        toolCallId: String? = nil,
+        toolName: String? = nil
+    ) {
+        self.role = role
+        self.content = content
+        self.toolCalls = toolCalls
+        self.toolCallId = toolCallId
+        self.toolName = toolName
+    }
+
+    public static func user(_ text: String) -> LLMChatMessage {
+        LLMChatMessage(role: .user, content: text)
+    }
+
+    public static func assistant(_ text: String, toolCalls: [LLMToolCall] = []) -> LLMChatMessage {
+        LLMChatMessage(role: .assistant, content: text, toolCalls: toolCalls)
+    }
+
+    public static func toolResult(id: String, name: String, content: String) -> LLMChatMessage {
+        LLMChatMessage(role: .tool, content: content, toolCallId: id, toolName: name)
+    }
+}
+
+/// Output from a single streaming LLM generation request.
+nonisolated public struct LLMStreamResult: Sendable, Equatable {
+    public let text: String
+    public let toolCalls: [LLMToolCall]
+    public let providerName: String
+    public let modelName: String
+
+    public init(
+        text: String,
+        toolCalls: [LLMToolCall] = [],
+        providerName: String = "Mock",
+        modelName: String = "mock"
+    ) {
+        self.text = text
+        self.toolCalls = toolCalls
+        self.providerName = providerName
+        self.modelName = modelName
+    }
+}
+
 /// Protocol for Large Language Model (LLM) query clients.
 nonisolated public protocol LLMClient: Sendable {
     /// Generates a response for the provided prompt.
@@ -24,11 +87,43 @@ nonisolated public protocol LLMClient: Sendable {
     ///   - language: Language target (English or Hinglish).
     /// - Returns: Generated reply text.
     func generateResponse(prompt: String, language: VoiceAgentViewModel.Language) async throws -> String
+
+    /// Streams a chat completion with tool-calling support.
+    /// - Parameters:
+    ///   - messages: Conversation messages (user, assistant, tool results).
+    ///   - systemPrompt: System instruction string.
+    ///   - tools: Available tool schema definitions.
+    ///   - onFirstToken: Invoked once when the first token or tool-call chunk arrives.
+    ///   - onTextDelta: Invoked for each streamed text delta chunk.
+    /// - Returns: Final accumulated text and any requested tool calls.
+    func streamChat(
+        messages: [LLMChatMessage],
+        systemPrompt: String,
+        tools: [LLMToolDefinition],
+        onFirstToken: (@Sendable () -> Void)?,
+        onTextDelta: (@Sendable (String) -> Void)?
+    ) async throws -> LLMStreamResult
 }
 
 public extension LLMClient {
     nonisolated func generateResponse(prompt: String) async throws -> String {
         try await generateResponse(prompt: prompt, language: .english)
+    }
+
+    nonisolated func streamChat(
+        messages: [LLMChatMessage],
+        systemPrompt: String,
+        tools: [LLMToolDefinition],
+        onFirstToken: (@Sendable () -> Void)? = nil,
+        onTextDelta: (@Sendable (String) -> Void)? = nil
+    ) async throws -> LLMStreamResult {
+        let lastUserPrompt = messages.last(where: { $0.role == .user })?.content ?? ""
+        let reply = try await generateResponse(prompt: lastUserPrompt, language: .english)
+        onFirstToken?()
+        if !reply.isEmpty {
+            onTextDelta?(reply)
+        }
+        return LLMStreamResult(text: reply, toolCalls: [], providerName: "Mock", modelName: "mock")
     }
 }
 
@@ -80,31 +175,25 @@ nonisolated public final class MockSpeechToText: SpeechToText, Sendable {
     }
 }
 
-/// Mock LLM client for testing and Phase 1 skeleton.
+#if DEBUG
+/// Preview-only mock LLM client (restricted to SwiftUI Previews; never used in runtime path).
 nonisolated public final class MockLLMClient: LLMClient, Sendable {
     public let simulatedDelay: TimeInterval
     public let customResponse: String?
 
-    public nonisolated init(simulatedDelay: TimeInterval = 0.65, customResponse: String? = nil) {
+    public nonisolated init(simulatedDelay: TimeInterval = 0.0, customResponse: String? = nil) {
         self.simulatedDelay = simulatedDelay
         self.customResponse = customResponse
     }
 
     public nonisolated func generateResponse(prompt: String, language: VoiceAgentViewModel.Language) async throws -> String {
-        if simulatedDelay > 0 {
-            try await Task.sleep(nanoseconds: UInt64(simulatedDelay * 1_000_000_000))
-        }
         if let customResponse = customResponse {
             return customResponse
         }
-        switch language {
-        case .english:
-            return "The weather is sunny and pleasant at 24 degrees Celsius."
-        case .hinglish:
-            return "Aaj mausam bilkul suhana aur dhoop wala hai, lagbhag 24 degrees."
-        }
+        return "[Preview] \(prompt)"
     }
 }
+#endif
 
 /// Mock TTS engine for testing and Phase 1 skeleton.
 nonisolated public final class MockTextToSpeech: TextToSpeech, @unchecked Sendable {

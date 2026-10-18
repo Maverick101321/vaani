@@ -2,16 +2,19 @@ import SwiftUI
 
 /// Single toggle for developer TTS comparison controls (`TTS Lab`).
 /// Defaults to `false` so only the language toggle and mic appear on the main screen.
-nonisolated public let kDevTools: Bool = false
+nonisolated public let kDevTools: Bool = true
 
 struct ContentView: View {
     @State private var viewModel = VoiceAgentViewModel()
     @State private var isShowingTTSLab = false
+    @State private var isDevSectionExpanded = false
+    @State private var devPromptText: String = ""
+    @FocusState private var isDevPromptFocused: Bool
     
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 24) {
+                VStack(spacing: 18) {
                     // MARK: - Header & Language Toggle
                     headerSection
                     
@@ -19,22 +22,28 @@ struct ContentView: View {
                     stateBadge
 
                     modelStatusBadges
+
+                    if let error = viewModel.errorMessage {
+                        errorBanner(error)
+                    }
+
+                    if kDevTools {
+                        devControlsSection
+                    }
                     
                     // MARK: - Cards (Transcript & Response)
                     cardsSection
                     
                     // MARK: - Latency Readout
                     latencySection
-                    
-                    // MARK: - Audio Visualizer & Mic Control
-                    controlsSection
-                    
-                    if let error = viewModel.errorMessage {
-                        errorBanner(error)
-                    }
                 }
                 .padding(.horizontal, 20)
-                .padding(.vertical, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 16)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                bottomControlsDock
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Vaani")
@@ -70,28 +79,13 @@ struct ContentView: View {
             
             Spacer()
             
-            if kDevTools {
-                Button {
-                    isShowingTTSLab = true
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "slider.horizontal.3")
-                        Text("TTS Lab")
-                    }
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.accentColor.opacity(0.12), in: Capsule())
-                }
-            }
-            
             Picker("Language", selection: $viewModel.language) {
                 ForEach(VoiceAgentViewModel.Language.allCases) { lang in
                     Text(lang.rawValue).tag(lang)
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 165)
+            .frame(width: 175)
         }
     }
     
@@ -174,6 +168,196 @@ struct ContentView: View {
             .padding(.vertical, 6)
             .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
         }
+    }
+
+    // MARK: - Collapsible Dev Section (`kDevTools` only)
+
+    private var effectiveDevEngineBinding: Binding<TTSEngine> {
+        Binding(
+            get: {
+                if viewModel.devTTSOverrideEnabled {
+                    return viewModel.ttsEngine
+                }
+                return viewModel.language == .english ? .apple : .kokoro
+            },
+            set: { newEngine in
+                viewModel.devTTSOverrideEnabled = true
+                viewModel.ttsEngine = newEngine
+            }
+        )
+    }
+
+    private var effectiveDevKokoroStrategyBinding: Binding<KokoroStrategy> {
+        Binding(
+            get: {
+                if viewModel.devTTSOverrideEnabled {
+                    return viewModel.kokoroStrategy
+                }
+                return .k2DevanagariMixHi
+            },
+            set: { newStrategy in
+                viewModel.devTTSOverrideEnabled = true
+                viewModel.kokoroStrategy = newStrategy
+            }
+        )
+    }
+
+    private var devControlsSection: some View {
+        DisclosureGroup(isExpanded: $isDevSectionExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text(
+                        viewModel.devTTSOverrideEnabled
+                            ? "Custom dev TTS override active"
+                            : "Default: En → Apple Isha • Hinglish → Kokoro hf_beta (K2)"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(viewModel.devTTSOverrideEnabled ? .orange : .secondary)
+
+                    Spacer()
+
+                    if viewModel.devTTSOverrideEnabled {
+                        Button("Reset") {
+                            viewModel.devTTSOverrideEnabled = false
+                            viewModel.kokoroHindiSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
+                            viewModel.kokoroStrategy = .k2DevanagariMixHi
+                        }
+                        .font(.caption.weight(.semibold))
+                    }
+                }
+
+                HStack {
+                    Text("Engine")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("TTS Engine", selection: effectiveDevEngineBinding) {
+                        ForEach(TTSEngine.allCases) { engine in
+                            Text(engine.displayName).tag(engine)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 210)
+                }
+
+                if effectiveDevEngineBinding.wrappedValue == .kokoro {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Kokoro Strategy")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Picker("Kokoro Strategy", selection: effectiveDevKokoroStrategyBinding) {
+                            ForEach(KokoroStrategy.allCases) { strategy in
+                                Text(strategy.shortName).tag(strategy)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                }
+
+                HStack {
+                    if let provider = viewModel.lastAnsweringProvider {
+                        Label("LLM: \(provider)", systemImage: "bolt.horizontal.circle.fill")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.purple)
+                    } else {
+                        Text("LLM: Groq → Gemini fallback")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        isShowingTTSLab = true
+                    } label: {
+                        Label("Open TTS Lab", systemImage: "slider.horizontal.3")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            .padding(.top, 10)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "wrench.and.screwdriver.fill")
+                    .foregroundStyle(Color.accentColor)
+                Text("Dev")
+                    .font(.subheadline.weight(.semibold))
+                if viewModel.devTTSOverrideEnabled {
+                    Text("Override")
+                        .font(.caption2.weight(.bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.orange)
+                }
+                Spacer()
+                if let provider = viewModel.lastAnsweringProvider {
+                    Text(provider)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.purple)
+                }
+            }
+        }
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    // MARK: - Dev Tools Text Prompt Input (`kDevTools` only, pinned above Mic)
+
+    private var devTextPromptSection: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "keyboard")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            TextField("Ask Vaani in English or Hinglish...", text: $devPromptText)
+                .textFieldStyle(.plain)
+                .focused($isDevPromptFocused)
+                .submitLabel(.send)
+                .onSubmit {
+                    submitDevPrompt()
+                }
+
+            if isDevPromptFocused {
+                Button("Done") {
+                    isDevPromptFocused = false
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            }
+
+            Button {
+                submitDevPrompt()
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(
+                        devPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? Color.secondary.opacity(0.4)
+                            : Color.accentColor
+                    )
+            }
+            .disabled(devPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func submitDevPrompt() {
+        let trimmed = devPromptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        devPromptText = ""
+        isDevPromptFocused = false
+        viewModel.sendTextPrompt(trimmed)
     }
     
     // MARK: - Cards
@@ -267,9 +451,10 @@ struct ContentView: View {
                 }
             }
             
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 latencyMetricPill(label: "STT", ms: viewModel.latency.sttMs)
-                latencyMetricPill(label: "LLM", ms: viewModel.latency.llmMs)
+                latencyMetricPill(label: "LLM 1st", ms: viewModel.latency.llmFirstTokenMs)
+                latencyMetricPill(label: "LLM", ms: viewModel.latency.llmTotalMs)
                 latencyMetricPill(label: "TTS 1st", ms: viewModel.latency.ttsMs)
                 latencyMetricPill(label: "Total", ms: viewModel.latency.totalMs, isHighlighted: true)
             }
@@ -299,14 +484,34 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
     
-    // MARK: - Animated Audio Visualizer & Mic Button
+    // MARK: - Pinned Bottom Dock (Dev Text Input + Audio Visualizer + Mic Button)
     
+    private var bottomControlsDock: some View {
+        VStack(spacing: 10) {
+            if kDevTools {
+                devTextPromptSection
+            }
+
+            if !isDevPromptFocused {
+                controlsSection
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 10)
+        .padding(.bottom, 10)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Divider()
+        }
+    }
+
     private var controlsSection: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 12) {
             // Animated level meter while listening
-            audioLevelMeter
-                .frame(height: 64)
-                .padding(.top, 8)
+            if viewModel.state == .listening {
+                audioLevelMeter
+                    .frame(height: 44)
+            }
             
             // Large Mic Button
             micButton

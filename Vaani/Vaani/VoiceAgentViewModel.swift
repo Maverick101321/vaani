@@ -4,6 +4,11 @@ import Observation
 /// Metrics tracking execution latency across agent pipeline stages.
 public struct LatencyMetrics: Equatable, Sendable {
     public var sttMs: Double
+    /// Time until the first LLM token arrives (TTFT in ms).
+    public var llmFirstTokenMs: Double
+    /// Total LLM generation time in ms (including any tool calls).
+    public var llmTotalMs: Double
+    /// Total LLM time in ms (kept synchronized with `llmTotalMs`).
     public var llmMs: Double
     /// Time until TTS audio begins (time-to-first-audio).
     public var ttsMs: Double
@@ -19,6 +24,8 @@ public struct LatencyMetrics: Equatable, Sendable {
     
     public init(
         sttMs: Double = 0,
+        llmFirstTokenMs: Double = 0,
+        llmTotalMs: Double = 0,
         llmMs: Double = 0,
         ttsMs: Double = 0,
         ttsFirstAudioMs: Double = 0,
@@ -28,7 +35,10 @@ public struct LatencyMetrics: Equatable, Sendable {
         totalMs: Double = 0
     ) {
         self.sttMs = sttMs
-        self.llmMs = llmMs
+        self.llmFirstTokenMs = llmFirstTokenMs
+        let resolvedTotalLLM = llmTotalMs > 0 ? llmTotalMs : llmMs
+        self.llmTotalMs = resolvedTotalLLM
+        self.llmMs = llmMs > 0 ? llmMs : resolvedTotalLLM
         self.ttsMs = ttsMs
         self.ttsFirstAudioMs = ttsFirstAudioMs > 0 ? ttsFirstAudioMs : ttsMs
         self.ttsSynthMs = ttsSynthMs
@@ -95,7 +105,11 @@ public final class VoiceAgentViewModel {
     /// Selected language (English or Hinglish).
     public var language: Language = .english
     
-    /// Selected TTS engine (used in TTS Lab; main agent routes Hinglish -> Kokoro and English -> Apple, falling back to Apple if Kokoro fails to load).
+    /// Whether the user has explicitly touched a dev TTS engine/strategy toggle in the collapsible Dev section.
+    /// When `false` (default), routing is strictly: English -> Apple Isha (en-IN), Hinglish -> Kokoro hf_beta K2 (lang="hi").
+    public var devTTSOverrideEnabled: Bool = false
+
+    /// Selected TTS engine (used in TTS Lab or when `devTTSOverrideEnabled == true`).
     public var ttsEngine: TTSEngine = .kokoro
     
     /// Selected Kokoro Hinglish strategy (locked-in default `.k2DevanagariMixHi` with Hindi voice `hf_beta`).
@@ -152,6 +166,12 @@ public final class VoiceAgentViewModel {
     /// Optional error description for user-facing alerts or banners.
     public var errorMessage: String?
 
+    /// Name of the LLM provider + model that answered the most recent turn (e.g. `"Groq • llama-3.3-70b-versatile"`).
+    public var lastAnsweringProvider: String?
+
+    /// Phase 6 hook: invoked on `@MainActor` as each complete sentence is streamed from the LLM.
+    public var onSentenceStreamed: ((String) -> Void)?
+
     /// Download/load lifecycle for the on-device WhisperKit model.
     public var sttLoadingState: STTLoadingState = .loading
 
@@ -171,6 +191,7 @@ public final class VoiceAgentViewModel {
     public let audioRecorder: AudioRecorder
     public let sttClient: SpeechToText
     public let llmClient: LLMClient
+    public let orchestrator: AgentOrchestrator
     public let ttsClient: TextToSpeech
     public let kokoroTTS: KokoroTTS
     public let appleTTS: AppleTTS
@@ -185,13 +206,14 @@ public final class VoiceAgentViewModel {
     public init(
         audioRecorder: AudioRecorder = AudioRecorder(),
         sttClient: SpeechToText = WhisperKitSTT(),
-        llmClient: LLMClient = MockLLMClient(),
+        llmClient: LLMClient = AgentOrchestrator(),
         ttsClient: TextToSpeech = KokoroTTS(),
         appleFallbackTTS: AppleTTS = AppleTTS()
     ) {
         self.audioRecorder = audioRecorder
         self.sttClient = sttClient
         self.llmClient = llmClient
+        self.orchestrator = (llmClient as? AgentOrchestrator) ?? AgentOrchestrator(customClientOverride: llmClient)
         self.ttsClient = ttsClient
         self.kokoroTTS = (ttsClient as? KokoroTTS) ?? KokoroTTS()
         self.appleTTS = (ttsClient as? AppleTTS) ?? appleFallbackTTS
@@ -227,10 +249,28 @@ public final class VoiceAgentViewModel {
         if !(ttsClient is KokoroTTS) {
             kokoroLoadingState = .ready
         }
+
+        if llmClient is AgentOrchestrator {
+            validateAPIKeysForBanner()
+        }
+    }
+
+    /// Checks whether `Secrets.groqKey` or `Secrets.geminiKey` is empty and surfaces a clear in-UI banner if so.
+    public func validateAPIKeysForBanner() {
+        let groqEmpty = Secrets.groqKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let geminiEmpty = Secrets.geminiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if groqEmpty && geminiEmpty {
+            errorMessage = LLMError.missingAllAPIKeys.localizedDescription
+        } else if groqEmpty {
+            errorMessage = LLMError.missingAPIKey(provider: .groq).localizedDescription
+        } else if geminiEmpty {
+            errorMessage = LLMError.missingAPIKey(provider: .gemini).localizedDescription
+        }
     }
 
     /// Starts STT and Kokoro TTS model setup asynchronously once the app UI has appeared.
     public func prepareSpeechToText() {
+        validateAPIKeysForBanner()
         prepareTextToSpeech()
 
         guard let whisperSTT = sttClient as? WhisperKitSTT, !isSTTReady else { return }
@@ -270,7 +310,7 @@ public final class VoiceAgentViewModel {
         }
     }
     
-    // MARK: - Voice Pipeline Controls
+    // MARK: - Voice & Dev Text Pipeline Controls
     
     /// Toggles listening state on/off.
     public func toggleListening() {
@@ -292,6 +332,7 @@ public final class VoiceAgentViewModel {
         appleTTS.stop()
         ttsClient.stop()
         errorMessage = nil
+        validateAPIKeysForBanner()
         state = .listening
         
         activeTask = Task {
@@ -321,16 +362,56 @@ public final class VoiceAgentViewModel {
             // 1. Transcribe audio
             let transcribedText = await transcribe(samples: samples)
             guard !Task.isCancelled else { return }
+            guard !transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                state = .idle
+                return
+            }
             
-            // 2. Query LLM
+            // 2. Query LLM via AgentOrchestrator with the current language toggle (streams deltas to self.response)
             let generatedAnswer = await ask(prompt: transcribedText)
             guard !Task.isCancelled else { return }
+            guard !generatedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                state = .idle
+                return
+            }
             
-            // 3. Speak response (updates latency.ttsMs on first scheduled buffer / didStart and returns to .idle on completion)
+            // 3. Speak full reply (updates latency.ttsMs on first scheduled buffer / didStart and returns to .idle on completion)
             await speak(text: generatedAnswer)
             guard !Task.isCancelled else { return }
             
             // Total latency reflects time until audio begins (STT + LLM + TTS first-audio)
+            latency.totalMs = latency.sttMs + latency.llmMs + latency.ttsMs
+        }
+    }
+
+    /// Sends a typed text prompt directly through the agent loop (LLM -> TTS) without voice input (used by `kDevTools`).
+    public func sendTextPrompt(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        activeTask?.cancel()
+        _ = audioRecorder.stop()
+        kokoroTTS.stop()
+        appleTTS.stop()
+        ttsClient.stop()
+        audioLevel = 0.0
+        errorMessage = nil
+        validateAPIKeysForBanner()
+        transcript = trimmed
+
+        activeTask = Task {
+            latency = LatencyMetrics(sttMs: 0)
+
+            let generatedAnswer = await ask(prompt: trimmed)
+            guard !Task.isCancelled else { return }
+            guard !generatedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                state = .idle
+                return
+            }
+
+            await speak(text: generatedAnswer)
+            guard !Task.isCancelled else { return }
+
             latency.totalMs = latency.sttMs + latency.llmMs + latency.ttsMs
         }
     }
@@ -373,53 +454,111 @@ public final class VoiceAgentViewModel {
         return recognized
     }
     
-    /// Queries the language model with the prompt.
+    /// Queries the language model via `AgentOrchestrator`, streaming text deltas to `self.response` and recording `llmFirstTokenMs` and `llmTotalMs`.
     /// - Parameter prompt: Input prompt text. Defaults to nil (uses current transcript).
-    /// - Returns: Generated response text.
+    /// - Returns: Final generated response text.
     @discardableResult
     public func ask(prompt: String? = nil) async -> String {
-        // TODO: Replace stub with production LLM client (e.g. Gemini, OpenAI, Claude, or local LLM)
         state = .thinking
         let start = ContinuousClock.now
         
-        let inputPrompt = prompt ?? self.transcript
-        let generated: String
+        let inputPrompt = (prompt ?? self.transcript).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !inputPrompt.isEmpty else {
+            return ""
+        }
+
+        self.response = ""
+        self.errorMessage = nil
+        validateAPIKeysForBanner()
+
         do {
-            generated = try await llmClient.generateResponse(prompt: inputPrompt, language: language)
+            let turnResult = try await orchestrator.runTurn(
+                userText: inputPrompt,
+                language: language,
+                onFirstToken: { [weak self] ttftMs in
+                    Task { @MainActor [weak self] in
+                        self?.latency.llmFirstTokenMs = ttftMs
+                    }
+                },
+                onTextDelta: { [weak self] delta in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.response += delta
+                    }
+                },
+                onSentenceReady: { [weak self] sentence in
+                    // Phase 6 hook for sentence-level TTS streaming
+                    Task { @MainActor [weak self] in
+                        self?.onSentenceStreamed?(sentence)
+                    }
+                }
+            )
+
+            latency.llmFirstTokenMs = turnResult.firstTokenMs
+            latency.llmTotalMs = turnResult.totalMs
+            latency.llmMs = turnResult.totalMs
+            lastAnsweringProvider = "\(turnResult.providerName) • \(turnResult.modelName)"
+            self.response = turnResult.reply
+            return turnResult.reply
+        } catch is CancellationError {
+            return self.response
         } catch {
             print("LLM query error: \(error)")
-            generated = (language == .english)
-                ? "The weather is sunny and pleasant today."
-                : "Aaj mausam bilkul suhana aur dhoop wala hai."
+            let elapsed = (ContinuousClock.now - start).milliseconds
+            latency.llmTotalMs = elapsed
+            latency.llmMs = elapsed
+            errorMessage = error.localizedDescription
+            return ""
         }
-        
-        let elapsed = ContinuousClock.now - start
-        latency.llmMs = elapsed.milliseconds
-        self.response = generated
-        return generated
     }
     
     /// Synthesizes and speaks the given response text using the locked-in TTS configuration:
-    /// - **Hinglish mode**: Kokoro (`hf_beta`, strategy `K2` Devanagari mix, `lang = "hi"`), falling back to Apple TTS if Kokoro fails to load.
-    /// - **English mode**: Apple `AVSpeechSynthesizer` (`Isha (Premium, en-IN)`).
+    /// - **English mode (default)**: Apple `AVSpeechSynthesizer` (`Isha (Premium, en-IN)`).
+    /// - **Hinglish mode (default)**: Kokoro (`hf_beta`, strategy `K2` Devanagari mix, `lang = "hi"`), falling back to Apple TTS if Kokoro fails to load.
+    /// - **Dev Override (`devTTSOverrideEnabled == true`)**: Uses `ttsEngine` and `kokoroStrategy` / `ttsStrategy` only if the user explicitly touched the dev controls.
     /// `latency.ttsMs` records time-to-first-audio, while `latency.ttsTotalDurationMs` records full speech duration.
     /// - Parameter text: Response text to synthesize. Defaults to nil (uses current response).
     public func speak(text: String? = nil) async {
+        let inputSpeech = (text ?? self.response).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !inputSpeech.isEmpty else {
+            if !Task.isCancelled {
+                state = .idle
+            }
+            return
+        }
+
         state = .speaking
         let start = ContinuousClock.now
-        
-        let inputSpeech = text ?? self.response
+
+        // Default routing unless the user explicitly touched a dev TTS override control:
+        // English -> Apple Isha (en-IN)
+        // Hinglish -> Kokoro hf_beta K2 (lang="hi")
+        let useKokoro: Bool
+        if devTTSOverrideEnabled {
+            useKokoro = (ttsEngine == .kokoro) && kokoroTTS.isReady
+        } else {
+            useKokoro = (language == .hinglish) && kokoroTTS.isReady
+        }
+
         do {
-            if language == .hinglish && kokoroTTS.isReady {
-                kokoroTTS.hinglishStrategy = .k2DevanagariMixHi
+            if useKokoro {
+                let activeStrategy: KokoroStrategy = devTTSOverrideEnabled ? kokoroStrategy : .k2DevanagariMixHi
+                let activeSpeakerID: Int
+                if devTTSOverrideEnabled {
+                    activeSpeakerID = (language == .english) ? kokoroEnglishSpeakerID : kokoroHindiSpeakerID
+                } else {
+                    activeSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
+                }
+
+                kokoroTTS.hinglishStrategy = activeStrategy
                 kokoroTTS.hindiSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
                 kokoroTTS.speed = kokoroSpeed
 
                 let metrics = try await kokoroTTS.speakWithMetrics(
                     text: inputSpeech,
-                    language: .hinglish,
-                    strategyOverride: .k2DevanagariMixHi,
-                    speakerIDOverride: KokoroSpeaker.defaultHindiSpeakerID,
+                    language: language,
+                    strategyOverride: (language == .hinglish || devTTSOverrideEnabled) ? activeStrategy : nil,
+                    speakerIDOverride: activeSpeakerID,
                     speedOverride: kokoroSpeed
                 )
                 latency.ttsFirstAudioMs = metrics.firstAudioMs
@@ -430,6 +569,8 @@ public final class VoiceAgentViewModel {
                 latency.totalMs = latency.sttMs + latency.llmMs + metrics.firstAudioMs
             } else if (ttsClient is KokoroTTS) || (ttsClient is AppleTTS) {
                 // English mode (Isha Premium en-IN) or automatic AppleTTS fallback if Kokoro is not ready in Hinglish mode
+                latency.ttsSynthMs = 0.0
+                latency.ttsRTF = 0.0
                 appleTTS.hinglishStrategy = ttsStrategy
                 let metrics = try await appleTTS.speakWithMetrics(
                     text: inputSpeech,
@@ -439,11 +580,13 @@ public final class VoiceAgentViewModel {
                 )
                 latency.ttsFirstAudioMs = metrics.firstAudioMs
                 latency.ttsMs = metrics.firstAudioMs
-                latency.ttsSynthMs = metrics.firstAudioMs
+                latency.ttsSynthMs = 0.0
                 latency.ttsRTF = 0.0
                 latency.ttsTotalDurationMs = metrics.totalDurationMs
                 latency.totalMs = latency.sttMs + latency.llmMs + metrics.firstAudioMs
             } else {
+                latency.ttsSynthMs = 0.0
+                latency.ttsRTF = 0.0
                 try await ttsClient.speak(text: inputSpeech, language: language)
                 let elapsed = (ContinuousClock.now - start).milliseconds
                 latency.ttsFirstAudioMs = elapsed

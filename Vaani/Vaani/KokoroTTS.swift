@@ -446,8 +446,8 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
     private var _onFirstAudio: (@MainActor @Sendable (Double) -> Void)?
     private var _onMetrics: (@MainActor @Sendable (KokoroSynthesisMetrics) -> Void)?
 
-    /// Dedicated serial queue for C++ `sherpa-onnx` model loading and synthesis so calls never overlap.
-    private let inferenceQueue = DispatchQueue(label: "com.vaani.kokoro.inference", qos: .userInitiated)
+    /// Dedicated high-priority serial queue for C++ `sherpa-onnx` model loading and synthesis so ONNX Runtime threads run on P-cores.
+    private let inferenceQueue = DispatchQueue(label: "com.vaani.kokoro.inference", qos: .userInteractive)
     /// Shared serial queue for `AVAudioSession` configuration (shared with `AudioRecorder` and `AppleTTS`).
     private let sessionQueue: DispatchQueue
 
@@ -692,14 +692,14 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         let speakers = Int(wrapper.numSpeakers)
         let loadMs = (ContinuousClock.now - loadStart).milliseconds
 
-        // Silent warmup synthesis so ONNX Runtime arena allocations and espeak-ng phonemizer tables are hot before first user utterance
+        // Silent warmup synthesis for a full short clause so ONNX Runtime arena allocations and espeak-ng phonemizer tables are hot before first user utterance
         let warmupStart = ContinuousClock.now
-        let warmupConfig = SherpaOnnxGenerationConfigSwift(
+        let warmupHiConfig = SherpaOnnxGenerationConfigSwift(
             speed: 1.0,
             sid: KokoroSpeaker.defaultHindiSpeakerID,
             extra: ["lang": "hi"]
         )
-        _ = wrapper.generateWithConfig(text: "नमस्ते", config: warmupConfig, callback: nil, arg: nil)
+        _ = wrapper.generateWithConfig(text: "नमस्ते, आज मौसम सुहाना है।", config: warmupHiConfig, callback: nil, arg: nil)
         let warmupMs = (ContinuousClock.now - warmupStart).milliseconds
 
         lock.lock()
@@ -710,7 +710,7 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         lock.unlock()
 
         print(String(
-            format: "[KokoroTTS] Ready in %.0f ms + warmup %.0f ms (sampleRate=%.0f Hz, speakers=%d, threads=%d, provider=cpu)",
+            format: "[KokoroTTS] Ready in %.0f ms + warmup %.0f ms (sampleRate=%.0f Hz, speakers=%d, threads=%d, qos=userInteractive, provider=cpu)",
             loadMs,
             warmupMs,
             rate,
@@ -727,8 +727,8 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
 
     // MARK: - Clause Splitting for Low First-Audio Latency
 
-    /// Splits an utterance into sentences or short clauses so the first clause can be synthesized and played immediately
-    /// while remaining clauses are synthesized and queued onto `AVAudioPlayerNode`.
+    /// Splits an utterance into sentences or short clauses so Clause 1 (~3–5 words, ~18–30 chars) can be synthesized
+    /// and played in ~0.9–1.3s while remaining clauses are synthesized and queued onto `AVAudioPlayerNode`.
     public static nonisolated func splitIntoClauses(_ text: String) -> [String] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
@@ -752,17 +752,18 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
             rawParts.append(remainder)
         }
 
-        // Merge tiny fragments (< 14 chars, e.g. abbreviations or short prefixes) into the following or preceding clause,
-        // and split overly long unpunctuated clauses (> 55 chars) on natural Hindi/English conjunctions.
+        // Merge tiny fragments (< 12 chars, e.g. "हाँ," or "OK,") into the next clause so Clause 1 has enough audio
+        // (~1.2s+) to cover Clause 2 synthesis, then aggressively cap Clause 1 at ~28 chars / 4-5 words.
         var merged: [String] = []
         var pendingPrefix = ""
 
         for part in rawParts {
             let combined = pendingPrefix.isEmpty ? part : "\(pendingPrefix) \(part)"
-            if combined.count < 14 {
+            if combined.count < 12 {
                 pendingPrefix = combined
             } else {
-                merged.append(contentsOf: splitLongClauseIfNeeded(combined))
+                let isFirst = merged.isEmpty
+                merged.append(contentsOf: splitClauseForLowLatency(combined, isFirstClause: isFirst))
                 pendingPrefix = ""
             }
         }
@@ -777,19 +778,59 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         return merged.isEmpty ? [trimmed] : merged
     }
 
-    private static nonisolated func splitLongClauseIfNeeded(_ clause: String) -> [String] {
-        guard clause.count > 55 else { return [clause] }
-        let conjunctions = [" और ", " लेकिन ", " पर ", " क्योंकि ", " तो ", " तथा ", " and ", " but ", " so "]
-        for conj in conjunctions {
+    private static nonisolated func splitClauseForLowLatency(_ clause: String, isFirstClause: Bool) -> [String] {
+        let maxChars = isFirstClause ? 28 : 48
+        let maxWords = isFirstClause ? 5 : 8
+
+        let words = clause.split(whereSeparator: \.isWhitespace).map(String.init)
+        if clause.count <= maxChars && words.count <= maxWords {
+            return [clause]
+        }
+
+        // 1. Try natural Hindi / Hinglish / English phrase & conjunction boundaries first
+        let phraseConjunctions = [
+            " और ", " लेकिन ", " क्योंकि ", " इसलिए ", " तो ", " तथा ", " या ", " जहां ", " जब ", " अगर ", " फिर ",
+            " के बाद ", " के साथ ", " के लिए ", " लगभग ",
+            " and ", " but ", " so ", " because ", " with ", " while ", " when ", " if ", " after ", " before ", " where ", " around ", " at "
+        ]
+        for conj in phraseConjunctions {
             if let range = clause.range(of: conj, options: .caseInsensitive) {
                 let left = String(clause[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                 let right = String(clause[range.lowerBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if left.count >= 16 && right.count >= 14 {
-                    return [left] + splitLongClauseIfNeeded(right)
+                let leftWords = left.split(whereSeparator: \.isWhitespace).count
+                let rightWords = right.split(whereSeparator: \.isWhitespace).count
+                if left.count >= 12, leftWords >= 3, left.count <= maxChars + 10, right.count >= 10, rightWords >= 2 {
+                    return [left] + splitClauseForLowLatency(right, isFirstClause: false)
                 }
             }
         }
-        return [clause]
+
+        // 2. Fallback word-boundary split when a clause has no comma or conjunction within the target window
+        let targetWordCount = isFirstClause ? 4 : 7
+        guard words.count >= targetWordCount + 2 else {
+            return [clause]
+        }
+
+        var splitIndex = min(targetWordCount, words.count - 2)
+
+        // Keep Hindi postpositions attached to the preceding noun ("बेंगलुरु में", "शाम को", "5 बजे तक")
+        let hindiPostpositions: Set<String> = ["में", "पर", "को", "से", "के", "का", "की", "ने", "तक", "भी", "ही", "बजे"]
+        if splitIndex < words.count - 2, hindiPostpositions.contains(words[splitIndex]) {
+            splitIndex += 1
+        }
+
+        // Avoid ending the left chunk on an English determiner/preposition ("the", "a", "an", "in", "on", "at", "to", "of", "for")
+        let danglingEnglish: Set<String> = ["the", "a", "an", "in", "on", "at", "to", "of", "for", "with", "by", "from"]
+        if splitIndex > 2, danglingEnglish.contains(words[splitIndex - 1].lowercased()) {
+            splitIndex -= 1
+        }
+
+        let leftChunk = words[..<splitIndex].joined(separator: " ")
+        let rightChunk = words[splitIndex...].joined(separator: " ")
+        guard !leftChunk.isEmpty, !rightChunk.isEmpty else {
+            return [clause]
+        }
+        return [leftChunk] + splitClauseForLowLatency(rightChunk, isFirstClause: false)
     }
 
     // MARK: - TextToSpeech Protocol
@@ -909,6 +950,9 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         engine.attach(playerNode)
         try engine.connectNode(playerNode, to: engine.mainMixerNode, format: playbackFormat)
         engine.prepare()
+        // Pre-start the audio engine and player node BEFORE Clause 1 synthesis begins so the first buffer plays with zero cold-start delay
+        try? engine.start()
+        try? playerNode.playAudio()
 
         let utteranceStart = ContinuousClock.now
         let streamContext = KokoroStreamContext(
@@ -1020,7 +1064,7 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
                 var totalSynthMs: Double = 0
                 var totalGeneratedSamples: Int = 0
 
-                for clause in clauses {
+                for (idx, clause) in clauses.enumerated() {
                     if streamContext.isCancelled {
                         break
                     }
@@ -1036,7 +1080,8 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
                     )
                     unmanagedContext.release()
 
-                    totalSynthMs += (ContinuousClock.now - clauseStart).milliseconds
+                    let clauseSynthMs = (ContinuousClock.now - clauseStart).milliseconds
+                    totalSynthMs += clauseSynthMs
 
                     // If sherpa-onnx returned the clause samples without invoking the progress callback, schedule immediately
                     let afterScheduled = streamContext.totalSamplesScheduled
@@ -1049,7 +1094,19 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
                         }
                     }
 
-                    totalGeneratedSamples += Int(generatedAudio.n)
+                    let clauseSamples = Int(generatedAudio.n)
+                    totalGeneratedSamples += clauseSamples
+
+                    print(String(
+                        format: "[KokoroTTS CLAUSE] idx=%d/%d chars=%d samples=%d clauseSynthMs=%.0f firstAudioMs=%.0f text=%@",
+                        idx + 1,
+                        clauses.count,
+                        clause.count,
+                        clauseSamples,
+                        clauseSynthMs,
+                        streamContext.firstAudioMs ?? -1,
+                        clause.debugDescription
+                    ))
                 }
 
                 let totalSamples = max(streamContext.totalSamplesScheduled, totalGeneratedSamples)
