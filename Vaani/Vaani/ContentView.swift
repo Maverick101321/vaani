@@ -1,5 +1,9 @@
 import SwiftUI
 
+/// Single toggle for developer TTS comparison controls (`TTS Lab`).
+/// Defaults to `false` so only the language toggle and mic appear on the main screen.
+nonisolated public let kDevTools: Bool = false
+
 struct ContentView: View {
     @State private var viewModel = VoiceAgentViewModel()
     @State private var isShowingTTSLab = false
@@ -14,7 +18,7 @@ struct ContentView: View {
                     // MARK: - Current State Indicator
                     stateBadge
 
-                    sttLoadingBadge
+                    modelStatusBadges
                     
                     // MARK: - Cards (Transcript & Response)
                     cardsSection
@@ -36,12 +40,14 @@ struct ContentView: View {
             .navigationTitle("Vaani")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        isShowingTTSLab = true
-                    } label: {
-                        Label("TTS Lab", systemImage: "speaker.wave.2.bubble.left.fill")
-                            .font(.subheadline.weight(.medium))
+                if kDevTools {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            isShowingTTSLab = true
+                        } label: {
+                            Label("TTS Lab", systemImage: "speaker.wave.2.bubble.left.fill")
+                                .font(.subheadline.weight(.medium))
+                        }
                     }
                 }
             }
@@ -57,14 +63,14 @@ struct ContentView: View {
     // MARK: - Header & Language
     
     private var headerSection: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Label("Voice Agent", systemImage: "waveform.circle.fill")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-                
-                Spacer()
-                
+        HStack {
+            Label("Voice Agent", systemImage: "waveform.circle.fill")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            
+            Spacer()
+            
+            if kDevTools {
                 Button {
                     isShowingTTSLab = true
                 } label: {
@@ -77,36 +83,15 @@ struct ContentView: View {
                     .padding(.vertical, 6)
                     .background(Color.accentColor.opacity(0.12), in: Capsule())
                 }
-                
-                Picker("Language", selection: $viewModel.language) {
-                    ForEach(VoiceAgentViewModel.Language.allCases) { lang in
-                        Text(lang.rawValue).tag(lang)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 165)
             }
             
-            if viewModel.language == .hinglish {
-                HStack {
-                    Text("Hinglish TTS:")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    
-                    Picker("Hinglish TTS Strategy", selection: $viewModel.ttsStrategy) {
-                        ForEach(TTSStrategy.allCases) { strategy in
-                            Text(strategy.displayName).tag(strategy)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .font(.caption)
-                    
-                    Spacer()
+            Picker("Language", selection: $viewModel.language) {
+                ForEach(VoiceAgentViewModel.Language.allCases) { lang in
+                    Text(lang.rawValue).tag(lang)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
+            .pickerStyle(.segmented)
+            .frame(width: 165)
         }
     }
     
@@ -149,23 +134,46 @@ struct ContentView: View {
         }
     }
 
-    private var sttLoadingBadge: some View {
-        HStack(spacing: 8) {
-            if !viewModel.isSTTReady {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            }
+    private var modelStatusBadges: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                if !viewModel.isSTTReady {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
 
-            Text(viewModel.sttLoadingState.displayName)
-                .font(.footnote.weight(.medium))
-                .foregroundStyle(viewModel.isSTTReady ? .green : .secondary)
+                Text(viewModel.sttLoadingState.displayName)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(viewModel.isSTTReady ? .green : .secondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
+
+            HStack(spacing: 8) {
+                switch viewModel.kokoroLoadingState {
+                case .loading:
+                    ProgressView()
+                        .controlSize(.small)
+                case .ready:
+                    Image(systemName: "waveform.badge.checkmark")
+                        .foregroundStyle(.green)
+                case .failed:
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundStyle(.orange)
+                }
+
+                Text(viewModel.kokoroLoadingState.displayName)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(viewModel.isKokoroReady ? .green : .secondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
     }
     
     // MARK: - Cards
@@ -243,7 +251,16 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .textCase(.uppercase)
                 Spacer()
-                if viewModel.latency.ttsTotalDurationMs > 0 {
+                if viewModel.latency.ttsSynthMs > 0 && viewModel.latency.ttsRTF > 0 {
+                    Text(String(
+                        format: "Synth: %.0f ms • RTF: %.2f • Play: %.0f ms",
+                        viewModel.latency.ttsSynthMs,
+                        viewModel.latency.ttsRTF,
+                        viewModel.latency.ttsTotalDurationMs
+                    ))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                } else if viewModel.latency.ttsTotalDurationMs > 0 {
                     Text(String(format: "TTS Play: %.0f ms", viewModel.latency.ttsTotalDurationMs))
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -406,10 +423,11 @@ struct TTSLabView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var customText: String = "Aaj mausam bilkul suhana hai, lagbhag 24 degrees."
-    @State private var selectedVoiceID: String = "" //Empty string = Auto (Best for Strategy)
-    @State private var installedVoices: [TTSVoiceInfo] = []
+    @State private var selectedKokoroSpeakerID: Int = KokoroSpeaker.defaultHindiSpeakerID
     @State private var isPlaying: Bool = false
     @State private var firstAudioMs: Double?
+    @State private var synthMs: Double?
+    @State private var rtfValue: Double?
     @State private var totalDurationMs: Double?
     @State private var lastSpokenVoiceLabel: String?
     @State private var lastSpokenText: String?
@@ -433,19 +451,19 @@ struct TTSLabView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    // 1. Strategy Picker
-                    strategyCard
+                    // 1. Engine & Strategy Picker
+                    engineAndStrategyCard
 
-                    // 2. Voice Picker
-                    voicePickerCard
+                    // 2. Speaker / Voice & Speed Picker
+                    voiceAndSpeedCard
 
                     // 3. Text Input & Transliteration Preview
                     textInputCard
 
-                    // 4. Play Button & Latency Readout
+                    // 4. Play Button & Latency / RTF Readout
                     playbackAndMetricsCard
 
-                    // 5. Preset Sentence Buttons
+                    // 5. Preset Sentence Buttons (8 presets)
                     presetsSection
                 }
                 .padding(20)
@@ -464,7 +482,17 @@ struct TTSLabView: View {
             }
         }
         .onAppear {
-            installedVoices = AppleTTS.availableVoices()
+            selectedKokoroSpeakerID = (viewModel.kokoroStrategy == .k3RomanizedEnUS)
+                ? viewModel.kokoroEnglishSpeakerID
+                : viewModel.kokoroHindiSpeakerID
+        }
+        .onChange(of: viewModel.kokoroStrategy) { _, newStrategy in
+            switch newStrategy {
+            case .k1RomanizedHi, .k2DevanagariMixHi:
+                selectedKokoroSpeakerID = viewModel.kokoroHindiSpeakerID
+            case .k3RomanizedEnUS:
+                selectedKokoroSpeakerID = viewModel.kokoroEnglishSpeakerID
+            }
         }
         .onDisappear {
             stopPlayback()
@@ -473,68 +501,180 @@ struct TTSLabView: View {
 
     // MARK: - Sections
 
-    private var strategyCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label("Hinglish Strategy", systemImage: "Character.bubble.fill")
-                .font(.caption.weight(.bold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-
-            Picker("Strategy", selection: $viewModel.ttsStrategy) {
-                ForEach(TTSStrategy.allCases) { strategy in
-                    Text(strategy.displayName).tag(strategy)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            Text(viewModel.ttsStrategy.subtitle)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(16)
-        .background(Color(uiColor: .secondarySystemGroupedBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-
-    private var voicePickerCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private var engineAndStrategyCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label("Installed Voices", systemImage: "person.wave.2.fill")
+                Label("TTS Engine", systemImage: "cpu.fill")
                     .font(.caption.weight(.bold))
                     .foregroundStyle(.secondary)
                     .textCase(.uppercase)
 
                 Spacer()
 
-                Text("\(installedVoices.count) voices")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-
-            Picker("Select Voice", selection: $selectedVoiceID) {
-                Text(autoVoiceDescription).tag("")
-                ForEach(installedVoices) { voice in
-                    Text(voice.displayLabel).tag(voice.id)
+                if viewModel.ttsEngine == .kokoro {
+                    Text(viewModel.kokoroLoadingState.displayName)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(viewModel.isKokoroReady ? .green : .orange)
                 }
             }
-            .pickerStyle(.menu)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(Color(uiColor: .tertiarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            Picker("Engine", selection: $viewModel.ttsEngine) {
+                ForEach(TTSEngine.allCases) { engine in
+                    Text(engine.displayName).tag(engine)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Divider()
+
+            Label("Hinglish Strategy", systemImage: "character.bubble.fill")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+
+            if viewModel.ttsEngine == .kokoro {
+                Picker("Kokoro Strategy", selection: $viewModel.kokoroStrategy) {
+                    ForEach(KokoroStrategy.allCases) { strategy in
+                        Text(strategy.shortName).tag(strategy)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(viewModel.kokoroStrategy.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker("Apple Strategy", selection: $viewModel.ttsStrategy) {
+                    ForEach(TTSStrategy.allCases) { strategy in
+                        Text(strategy.displayName).tag(strategy)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(viewModel.ttsStrategy.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(16)
         .background(Color(uiColor: .secondarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    private var autoVoiceDescription: String {
-        let pair = viewModel.ttsStrategy.languagePreference
-        if let best = AppleTTS.bestVoiceInfo(primaryLanguage: pair.primary, fallbackLanguage: pair.fallback) {
-            return "Auto (Best: \(best.displayLabel))"
+    private var voiceAndSpeedCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if viewModel.ttsEngine == .kokoro {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Label("Kokoro Voice", systemImage: "person.wave.2.fill")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+
+                        Spacer()
+
+                        Text("\(KokoroSpeaker.curatedSpeakers.count) voices")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+
+                    Text("Kokoro-82M v1.0 (int8), runs fully on-device")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Picker("Select Kokoro Speaker", selection: $selectedKokoroSpeakerID) {
+                    ForEach(KokoroSpeaker.curatedSpeakers) { speaker in
+                        Text(speaker.displayLabel).tag(speaker.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(uiColor: .tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .onChange(of: selectedKokoroSpeakerID) { _, newID in
+                    let speaker = KokoroSpeaker.speaker(forID: newID)
+                    if speaker.isHindi {
+                        viewModel.kokoroHindiSpeakerID = newID
+                    } else if speaker.isEnglish {
+                        viewModel.kokoroEnglishSpeakerID = newID
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Speech Speed", systemImage: "gauge.with.dots.needle.67percent")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+
+                        Spacer()
+
+                        Text(String(format: "%.2fx", viewModel.kokoroSpeed))
+                            .font(.caption.weight(.bold).monospacedDigit())
+                            .foregroundStyle(.blue)
+
+                        if abs(viewModel.kokoroSpeed - 1.0) > 0.01 {
+                            Button("Reset") {
+                                viewModel.kokoroSpeed = 1.0
+                            }
+                            .font(.caption2)
+                        }
+                    }
+
+                    Slider(value: $viewModel.kokoroSpeed, in: 0.8...1.3, step: 0.05)
+
+                    HStack {
+                        Text("0.8x (Slower)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                        Text("1.0x")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                        Text("1.3x (Faster)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            } else {
+                HStack {
+                    Label("Apple Voice", systemImage: "person.wave.2.fill")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+
+                    Spacer()
+                }
+
+                HStack {
+                    Text(AppleTTS.ishaVoiceInfo.displayLabel)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color(uiColor: .tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
         }
-        return "Auto (Best for \(pair.primary))"
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var isDevanagariPreviewActive: Bool {
+        if viewModel.ttsEngine == .kokoro {
+            return viewModel.kokoroStrategy == .k2DevanagariMixHi
+        } else {
+            return viewModel.ttsStrategy == .devanagariHiIN
+        }
     }
 
     private var textInputCard: some View {
@@ -561,9 +701,9 @@ struct TTSLabView: View {
                 .background(Color(uiColor: .tertiarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-            if viewModel.ttsStrategy == .devanagariHiIN && !customText.isEmpty {
+            if isDevanagariPreviewActive && !customText.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Strategy C Heuristic Devanagari Preview:")
+                    Text("Devanagari Mix Preview (\(HinglishTransliterator.commonHindiWords.count) Hindi words dict):")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text(HinglishTransliterator.transliterate(customText))
@@ -604,18 +744,33 @@ struct TTSLabView: View {
             }
             .disabled(customText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isPlaying)
 
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 metricBox(
-                    title: "Time to First Audio",
+                    title: "First Audio",
                     value: firstAudioMs.map { String(format: "%.0f ms", $0) } ?? "--",
                     highlighted: true
                 )
 
                 metricBox(
-                    title: "Total Duration",
-                    value: totalDurationMs.map { String(format: "%.0f ms", $0) } ?? "--",
+                    title: "Synth Time",
+                    value: synthMs.map { String(format: "%.0f ms", $0) } ?? "--",
                     highlighted: false
                 )
+
+                metricBox(
+                    title: "RTF",
+                    value: rtfValue.map { String(format: "%.2f", $0) } ?? "--",
+                    highlighted: false
+                )
+            }
+
+            if let totalMs = totalDurationMs {
+                HStack {
+                    Text(String(format: "Total Playback Duration: %.0f ms", totalMs))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
             }
 
             if let voiceLabel = lastSpokenVoiceLabel {
@@ -624,7 +779,7 @@ struct TTSLabView: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                     if let spoken = lastSpokenText {
-                        Text("Spoken: \"\(spoken)\"")
+                        Text("Sent to model: \"\(spoken)\"")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
@@ -643,7 +798,7 @@ struct TTSLabView: View {
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(.secondary)
             Text(value)
-                .font(.title3.weight(.bold).monospacedDigit())
+                .font(.headline.weight(.bold).monospacedDigit())
                 .foregroundStyle(highlighted ? Color.blue : Color.primary)
         }
         .frame(maxWidth: .infinity)
@@ -715,45 +870,90 @@ struct TTSLabView: View {
         let textToSpeak = customText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !textToSpeak.isEmpty else { return }
 
-        let chosenStrategy = viewModel.ttsStrategy
-        let voiceOverride = selectedVoiceID.isEmpty ? nil : selectedVoiceID
+        let activeEngine = viewModel.ttsEngine
+        let chosenKokoroStrategy = viewModel.kokoroStrategy
+        let chosenKokoroSpeaker = selectedKokoroSpeakerID
+        let chosenKokoroSpeed = viewModel.kokoroSpeed
+        let chosenAppleStrategy = viewModel.ttsStrategy
 
         isPlaying = true
         firstAudioMs = nil
+        synthMs = nil
+        rtfValue = nil
         totalDurationMs = nil
 
         playTask = Task {
-            let appleTTS = (viewModel.ttsClient as? AppleTTS) ?? AppleTTS(hinglishStrategy: chosenStrategy)
-            let previousFirstAudioHandler = appleTTS.onFirstAudio
+            if activeEngine == .kokoro && viewModel.kokoroTTS.isReady {
+                let kokoro = viewModel.kokoroTTS
+                let previousFirstAudioHandler = kokoro.onFirstAudio
 
-            appleTTS.onFirstAudio = { ms in
-                self.firstAudioMs = ms
-                previousFirstAudioHandler?(ms)
-            }
-
-            defer {
-                appleTTS.onFirstAudio = previousFirstAudioHandler
-                if !Task.isCancelled {
-                    isPlaying = false
+                kokoro.onFirstAudio = { ms in
+                    self.firstAudioMs = ms
+                    previousFirstAudioHandler?(ms)
                 }
-            }
 
-            do {
-                let metrics = try await appleTTS.speakWithMetrics(
-                    text: textToSpeak,
-                    language: .hinglish,
-                    strategyOverride: chosenStrategy,
-                    voiceIdentifierOverride: voiceOverride
-                )
-                guard !Task.isCancelled else { return }
-                self.firstAudioMs = metrics.firstAudioMs
-                self.totalDurationMs = metrics.totalDurationMs
-                self.lastSpokenVoiceLabel = "\(metrics.voiceName) (\(metrics.voiceLanguage)) • \(metrics.voiceQuality) [\(metrics.voiceIdentifier)]"
-                self.lastSpokenText = metrics.spokenText
-            } catch is CancellationError {
-                // Stopped by user
-            } catch {
-                print("TTS Lab playback error: \(error)")
+                defer {
+                    kokoro.onFirstAudio = previousFirstAudioHandler
+                    if !Task.isCancelled {
+                        isPlaying = false
+                    }
+                }
+
+                do {
+                    let metrics = try await kokoro.speakWithMetrics(
+                        text: textToSpeak,
+                        language: .hinglish,
+                        strategyOverride: chosenKokoroStrategy,
+                        speakerIDOverride: chosenKokoroSpeaker,
+                        speedOverride: chosenKokoroSpeed
+                    )
+                    guard !Task.isCancelled else { return }
+                    self.firstAudioMs = metrics.firstAudioMs
+                    self.synthMs = metrics.synthMs
+                    self.rtfValue = metrics.rtf
+                    self.totalDurationMs = metrics.totalDurationMs
+                    self.lastSpokenVoiceLabel = "Kokoro [\(metrics.speakerID)] \(metrics.speakerName) (lang=\(metrics.lang), speed=\(String(format: "%.2fx", metrics.speed)))"
+                    self.lastSpokenText = metrics.spokenText
+                } catch is CancellationError {
+                    // Stopped by user
+                } catch {
+                    print("TTS Lab Kokoro playback error: \(error)")
+                }
+            } else {
+                let appleTTS = viewModel.appleTTS
+                let previousFirstAudioHandler = appleTTS.onFirstAudio
+
+                appleTTS.onFirstAudio = { ms in
+                    self.firstAudioMs = ms
+                    previousFirstAudioHandler?(ms)
+                }
+
+                defer {
+                    appleTTS.onFirstAudio = previousFirstAudioHandler
+                    if !Task.isCancelled {
+                        isPlaying = false
+                    }
+                }
+
+                do {
+                    let metrics = try await appleTTS.speakWithMetrics(
+                        text: textToSpeak,
+                        language: .hinglish,
+                        strategyOverride: chosenAppleStrategy,
+                        voiceIdentifierOverride: AppleTTS.ishaVoiceInfo.id
+                    )
+                    guard !Task.isCancelled else { return }
+                    self.firstAudioMs = metrics.firstAudioMs
+                    self.synthMs = metrics.firstAudioMs
+                    self.rtfValue = 0.0
+                    self.totalDurationMs = metrics.totalDurationMs
+                    self.lastSpokenVoiceLabel = "Apple \(metrics.voiceName) (\(metrics.voiceLanguage)) • \(metrics.voiceQuality) [\(metrics.voiceIdentifier)]"
+                    self.lastSpokenText = metrics.spokenText
+                } catch is CancellationError {
+                    // Stopped by user
+                } catch {
+                    print("TTS Lab Apple playback error: \(error)")
+                }
             }
         }
     }
@@ -761,6 +961,8 @@ struct TTSLabView: View {
     private func stopPlayback() {
         playTask?.cancel()
         playTask = nil
+        viewModel.kokoroTTS.stop()
+        viewModel.appleTTS.stop()
         viewModel.ttsClient.stop()
         isPlaying = false
     }

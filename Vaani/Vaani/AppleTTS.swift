@@ -148,41 +148,99 @@ nonisolated public struct TTSSynthesisMetrics: Equatable, Sendable {
 
 // MARK: - Heuristic Roman-to-Devanagari Transliterator (Strategy C)
 
-/// HEURISTIC: Simple local dictionary-based Roman-to-Devanagari transliterator for common Hindi words.
-/// Used exclusively for `TTSStrategy.devanagariHiIN` (Strategy C) so common Hindi words are rendered
-/// in Devanagari while English words (e.g., "weather", "alarm", "schedule", "meeting", "degrees")
-/// remain in Latin script.
+/// HEURISTIC: Local dictionary-based Roman-to-Devanagari transliterator and number/time normalizer for K2 / Strategy C.
+/// Converts common Romanized Hindi words, Indian city/place names, common English assistant loanwords,
+/// and time/number expressions (e.g., "5 PM" -> "शाम 5 बजे", "24 degrees" -> "24 डिग्री") into Devanagari.
 nonisolated public enum HinglishTransliterator {
-    /// HEURISTIC: Dictionary of ~130 common Romanized Hindi words mapped to Devanagari.
-    /// English loanwords commonly used in Hinglish (alarm, weather, meeting, schedule, etc.) are
-    /// intentionally excluded so they stay in Latin script.
+    /// HEURISTIC: Dictionary of common Romanized Hindi words, Indian cities/places, and English loanwords mapped to Devanagari.
     public static let commonHindiWords: [String: String] = [
-        // Time & days
+        // Time, clock & calendar words
         "aaj": "आज",
         "kal": "कल",
         "parso": "परसों",
+        "parson": "परसों",
+        "narso": "नरसों",
         "subah": "सुबह",
+        "savere": "सवेरे",
         "dopahar": "दोपहर",
         "shaam": "शाम",
         "raat": "रात",
+        "aadhi": "आधी",
         "abhi": "अभी",
         "ab": "अब",
         "tab": "तब",
+        "jab": "जब",
         "kab": "कब",
+        "kabhi": "कभी",
         "baje": "बजे",
+        "baja": "बजा",
+        "baj": "बज",
         "ghanta": "घंटा",
         "ghante": "घंटे",
+        "minat": "मिनट",
+        "pal": "पल",
         "din": "दिन",
+        "dino": "दिनों",
         "hafta": "हफ्ता",
         "hafte": "हफ्ते",
         "mahina": "महीना",
+        "mahine": "महीने",
         "saal": "साल",
+        "varsh": "वर्ष",
+        "taareekh": "तारीख़",
+        "tareekh": "तारीख़",
         "samay": "समय",
         "waqt": "वक़्त",
         "jaldi": "जल्दी",
         "der": "देर",
+        "deeri": "देरी",
         "roz": "रोज़",
+        "pratidin": "प्रतिदिन",
         "hamesha": "हमेशा",
+        "turant": "तुरंत",
+        "fauran": "फ़ौरन",
+
+        // Days of the week
+        "somwar": "सोमवार",
+        "mangalwar": "मंगलवार",
+        "budhwar": "बुधवार",
+        "guruwar": "गुरुवार",
+        "brihaspatiwar": "बृहस्पतिवार",
+        "shukrawar": "शुक्रवार",
+        "shaniwar": "शनिवार",
+        "raviwar": "रविवार",
+        "itwar": "इतवार",
+
+        // Numbers 1-12 & fractional time qualifiers
+        "ek": "एक",
+        "do": "दो",
+        "teen": "तीन",
+        "chaar": "चार",
+        "char": "चार",
+        "paanch": "पाँच",
+        "panch": "पाँच",
+        "chhah": "छह",
+        "cheh": "छह",
+        "che": "छह",
+        "saat": "सात",
+        "aath": "आठ",
+        "nau": "नौ",
+        "das": "दस",
+        "gyarah": "ग्यारह",
+        "barah": "बारह",
+        "sawa": "सवा",
+        "sadhe": "साढ़े",
+        "saadhe": "साढ़े",
+        "paune": "पौने",
+        "dedh": "डेढ़",
+        "dhai": "ढाई",
+        "aadha": "आधा",
+        "pehla": "पहला",
+        "pehli": "पहली",
+        "doosra": "दूसरा",
+        "doosri": "दूसरी",
+        "teesra": "तीसरा",
+        "aakhri": "आख़िरी",
 
         // Pronouns & possessives
         "main": "मैं",
@@ -211,11 +269,18 @@ nonisolated public enum HinglishTransliterator {
         "ye": "ये",
         "woh": "वह",
         "wo": "वो",
+        "is": "इस",
+        "us": "उस",
+        "in": "इन",
+        "un": "उन",
+        "iska": "इसका",
+        "uska": "उसका",
         "inka": "इनका",
         "unka": "उनका",
         "apna": "अपना",
         "apni": "अपनी",
         "apne": "अपने",
+        "khud": "ख़ुद",
 
         // Postpositions & connectors
         "ka": "का",
@@ -227,7 +292,6 @@ nonisolated public enum HinglishTransliterator {
         "se": "से",
         "par": "पर",
         "pe": "पे",
-        "तक": "तक",
         "tak": "तक",
         "liye": "लिए",
         "saath": "साथ",
@@ -238,18 +302,29 @@ nonisolated public enum HinglishTransliterator {
         "bahar": "बाहर",
         "upar": "ऊपर",
         "neeche": "नीचे",
+        "aage": "आगे",
+        "peeche": "पीछे",
         "paas": "पास",
         "door": "दूर",
         "aur": "और",
         "ya": "या",
         "lekin": "लेकिन",
         "magar": "मगर",
+        "parantu": "परंतु",
+        "kyunki": "क्योंकि",
+        "isliye": "इसलिए",
         "toh": "तो",
+        "phir": "फिर",
+        "fir": "फिर",
         "bhi": "भी",
         "hi": "ही",
+        "sirf": "सिर्फ़",
+        "bas": "बस",
         "wala": "वाला",
         "wali": "वाली",
         "wale": "वाले",
+        "bina": "बिना",
+        "baare": "बारे",
 
         // Interrogatives
         "kya": "क्या",
@@ -261,12 +336,16 @@ nonisolated public enum HinglishTransliterator {
         "kaisi": "कैसी",
         "kaise": "कैसे",
         "kaun": "कौन",
+        "kaunsa": "कौनसा",
+        "kaunsi": "कौनसी",
+        "kis": "किस",
+        "kisi": "किसी",
         "kitna": "कितना",
         "kitni": "कितनी",
         "kitne": "कितने",
         "kidhar": "किधर",
 
-        // Auxiliaries & common verbs
+        // Auxiliaries & common assistant verbs (reminder, alarm, schedule, search)
         "hai": "है",
         "hain": "हैं",
         "ho": "हो",
@@ -274,6 +353,9 @@ nonisolated public enum HinglishTransliterator {
         "hu": "हूँ",
         "tha": "था",
         "thi": "थी",
+        "the": "थे",
+        "hua": "हुआ",
+        "hui": "हुई",
         "hoga": "होगा",
         "hogi": "होगी",
         "honge": "होंगे",
@@ -283,68 +365,130 @@ nonisolated public enum HinglishTransliterator {
         "rahe": "रहे",
         "rahega": "रहेगा",
         "rahegi": "रहेगी",
+        "rahenge": "रहेंगे",
         "gaya": "गया",
         "gayi": "गई",
         "gaye": "गए",
         "kar": "कर",
         "karo": "करो",
+        "kariye": "करिए",
+        "kijiye": "कीजिए",
         "karna": "करना",
         "karni": "करनी",
         "karne": "करने",
         "kiya": "किया",
         "kiye": "किए",
         "diya": "दिया",
+        "diye": "दिए",
         "liya": "लिया",
         "dena": "देना",
+        "dijiye": "दीजिए",
         "lena": "लेना",
+        "lo": "लो",
         "batao": "बताओ",
         "bataiye": "बताइए",
         "batana": "बताना",
+        "bata": "बता",
         "chahiye": "चाहिए",
         "sakta": "सकता",
         "sakti": "सकती",
         "sakte": "सकते",
         "jaana": "जाना",
+        "jao": "जाओ",
         "aana": "आना",
+        "aao": "आओ",
+        "aaya": "आया",
+        "aayi": "आई",
         "dekho": "देखो",
+        "dekhna": "देखना",
+        "dekhiye": "देखिए",
         "bolo": "बोलो",
+        "bolna": "बोलना",
+        "suno": "सुनो",
+        "sunao": "सुनाओ",
+        "padho": "पढ़ो",
+        "likho": "लिखो",
+        "bhejo": "भेजो",
+        "dhundho": "ढूँढो",
+        "khojo": "खोजो",
         "lagao": "लगाओ",
+        "lagana": "लगाना",
+        "laga": "लगा",
+        "bajao": "बजाओ",
+        "bajana": "बजाना",
         "roko": "रोको",
+        "rokna": "रोकना",
+        "band": "बंद",
+        "shuru": "शुरू",
+        "khatam": "ख़त्म",
+        "badlo": "बदलो",
+        "hatao": "हटाओ",
+        "hatana": "हटाना",
+        "jodo": "जोड़ो",
         "rakho": "रखो",
         "rakhna": "रखना",
         "milega": "मिलेगा",
+        "milegi": "मिलेगी",
+        "milna": "मिलना",
+        "yaad": "याद",
+        "dilana": "दिलाना",
+        "dilao": "दिलाओ",
+        "bhool": "भूल",
+        "pata": "पता",
+        "maloom": "मालूम",
+        "samajh": "समझ",
+        "madad": "मदद",
+        "lagta": "लगता",
+        "lagti": "लगती",
 
-        // Weather, adjectives & everyday nouns
+        // Weather, adjectives & everyday assistant nouns
         "mausam": "मौसम",
+        "taapman": "तापमान",
         "dhoop": "धूप",
         "baarish": "बारिश",
         "barish": "बारिश",
+        "barsaat": "बरसात",
         "hawa": "हवा",
+        "toofan": "तूफ़ान",
+        "kohra": "कोहरा",
         "thand": "ठंड",
+        "sardi": "सर्दी",
         "thanda": "ठंडा",
         "thandi": "ठंडी",
         "garmi": "गर्मी",
         "garam": "गरम",
         "suhana": "सुहाना",
         "badal": "बादल",
+        "badli": "बदली",
+        "saaf": "साफ़",
         "halka": "हल्का",
         "halki": "हल्की",
         "tez": "तेज़",
+        "dheere": "धीरे",
         "zyada": "ज़्यादा",
         "kam": "कम",
+        "kaafi": "काफ़ी",
         "nahi": "नहीं",
         "nahin": "नहीं",
+        "na": "ना",
         "mat": "मत",
         "haan": "हाँ",
         "ji": "जी",
         "bilkul": "बिल्कुल",
+        "zaroor": "ज़रूर",
+        "shayad": "शायद",
         "bahut": "बहुत",
         "bohot": "बहुत",
         "thoda": "थोड़ा",
         "thodi": "थोड़ी",
         "kuch": "कुछ",
+        "kuchh": "कुछ",
         "sab": "सब",
         "sabhi": "सभी",
+        "saara": "सारा",
+        "saari": "सारी",
+        "poora": "पूरा",
+        "poori": "पूरी",
         "koi": "कोई",
         "har": "हर",
         "lagbhag": "लगभग",
@@ -352,34 +496,316 @@ nonisolated public enum HinglishTransliterator {
         "achha": "अच्छा",
         "accha": "अच्छा",
         "acchi": "अच्छी",
+        "acche": "अच्छे",
         "badiya": "बढ़िया",
+        "behtar": "बेहतर",
         "theek": "ठीक",
         "sahi": "सही",
         "galat": "ग़लत",
+        "zaroori": "ज़रूरी",
+        "khaas": "ख़ास",
+        "aasan": "आसान",
+        "mushkil": "मुश्किल",
+        "taiyar": "तैयार",
+        "khali": "ख़ाली",
+        "vyast": "व्यस्त",
         "naya": "नया",
         "nayi": "नई",
         "purana": "पुराना",
         "agla": "अगला",
         "agli": "अगली",
+        "agle": "अगले",
         "pichla": "पिछला",
+        "pichli": "पिछली",
+        "pichle": "पिछले",
         "kaam": "काम",
+        "baat": "बात",
+        "sawal": "सवाल",
+        "jawab": "जवाब",
+        "sandesh": "संदेश",
+        "suchi": "सूची",
+        "chhutti": "छुट्टी",
         "ghar": "घर",
+        "daftar": "दफ़्तर",
         "raasta": "रास्ता",
         "jagah": "जगह",
+        "shahar": "शहर",
         "khabar": "ख़बर",
         "paani": "पानी",
         "khana": "खाना",
         "chai": "चाय",
+        "dawai": "दवाई",
         "namaste": "नमस्ते",
+        "namaskar": "नमस्कार",
         "dhanyavaad": "धन्यवाद",
         "shukriya": "शुक्रिया",
-        "kripya": "कृपया"
+        "kripya": "कृपया",
+
+        // Indian cities, states & place names
+        "bangalore": "बेंगलुरु",
+        "bengaluru": "बेंगलुरु",
+        "hyderabad": "हैदराबाद",
+        "mumbai": "मुंबई",
+        "bombay": "मुंबई",
+        "delhi": "दिल्ली",
+        "dilli": "दिल्ली",
+        "chennai": "चेन्नई",
+        "madras": "चेन्नई",
+        "kolkata": "कोलकाता",
+        "calcutta": "कोलकाता",
+        "pune": "पुणे",
+        "ahmedabad": "अहमदाबाद",
+        "jaipur": "जयपुर",
+        "kochi": "कोच्चि",
+        "cochin": "कोच्चि",
+        "goa": "गोवा",
+        "lucknow": "लखनऊ",
+        "chandigarh": "चंडीगढ़",
+        "indore": "इंदौर",
+        "bhopal": "भोपाल",
+        "surat": "सूरत",
+        "nagpur": "नागपुर",
+        "patna": "पटना",
+        "gurgaon": "गुरुग्राम",
+        "gurugram": "गुरुग्राम",
+        "noida": "नोएडा",
+        "ghaziabad": "ग़ाज़ियाबाद",
+        "faridabad": "फ़रीदाबाद",
+        "varanasi": "वाराणसी",
+        "banaras": "बनारस",
+        "agra": "आगरा",
+        "amritsar": "अमृतसर",
+        "shimla": "शिमला",
+        "manali": "मनाली",
+        "dehradun": "देहरादून",
+        "haridwar": "हरिद्वार",
+        "rishikesh": "ऋषिकेश",
+        "mysore": "मैसूरु",
+        "mysuru": "मैसूरु",
+        "mangalore": "मंगलुरु",
+        "mangaluru": "मंगलुरु",
+        "coimbatore": "कोयंबटूर",
+        "madurai": "मदुरै",
+        "thiruvananthapuram": "तिरुवनंतपुरम",
+        "trivandrum": "तिरुवनंतपुरम",
+        "visakhapatnam": "विशाखापत्तनम",
+        "vizag": "वाइज़ाग",
+        "vijayawada": "विजयवाड़ा",
+        "guwahati": "गुवाहाटी",
+        "bhubaneswar": "भुवनेश्वर",
+        "ranchi": "राँची",
+        "raipur": "रायपुर",
+        "vadodara": "वडोदरा",
+        "baroda": "वडोदरा",
+        "rajkot": "राजकोट",
+        "udaipur": "उदयपुर",
+        "jodhpur": "जोधपुर",
+        "kanpur": "कानपुर",
+        "prayagraj": "प्रयागराज",
+        "allahabad": "इलाहाबाद",
+        "srinagar": "श्रीनगर",
+        "jammu": "जम्मू",
+        "leh": "लेह",
+        "ladakh": "लद्दाख",
+        "puducherry": "पुदुचेरी",
+        "pondicherry": "पांडिचेरी",
+        "ooty": "ऊटी",
+        "darjeeling": "दार्जिलिंग",
+        "gangtok": "गंगटोक",
+        "shillong": "शिलांग",
+        "india": "भारत",
+        "bharat": "भारत",
+        "karnataka": "कर्नाटक",
+        "maharashtra": "महाराष्ट्र",
+        "kerala": "केरल",
+        "rajasthan": "राजस्थान",
+        "gujarat": "गुजरात",
+        "punjab": "पंजाब",
+
+        // Common English loanwords spoken by the assistant
+        "meeting": "मीटिंग",
+        "meetings": "मीटिंग्स",
+        "reminder": "रिमाइंडर",
+        "reminders": "रिमाइंडर्स",
+        "alarm": "अलार्म",
+        "alarms": "अलार्म्स",
+        "schedule": "शेड्यूल",
+        "schedules": "शेड्यूल्स",
+        "scheduled": "शेड्यूल्ड",
+        "weather": "वेदर",
+        "degree": "डिग्री",
+        "degrees": "डिग्री",
+        "temperature": "टेम्परेचर",
+        "forecast": "फ़ोरकास्ट",
+        "today": "आज",
+        "tomorrow": "कल",
+        "yesterday": "कल",
+        "celsius": "सेल्सियस",
+        "fahrenheit": "फ़ारेनहाइट",
+        "set": "सेट",
+        "next": "नेक्स्ट",
+        "chance": "चांस",
+        "timer": "टाइमर",
+        "calendar": "कैलेंडर",
+        "event": "इवेंट",
+        "events": "इवेंट्स",
+        "call": "कॉल",
+        "calls": "कॉल्स",
+        "message": "मैसेज",
+        "messages": "मैसेजेस",
+        "notification": "नोटिफिकेशन",
+        "notifications": "नोटिफिकेशन्स",
+        "update": "अपडेट",
+        "cancel": "कैंसिल",
+        "traffic": "ट्रैफ़िक",
+        "office": "ऑफ़िस",
+        "flight": "फ़्लाइट",
+        "train": "ट्रेन",
+        "hotel": "होटल",
+        "time": "टाइम",
+        "minute": "मिनट",
+        "minutes": "मिनट",
+        "second": "सेकंड",
+        "seconds": "सेकंड",
+        "hour": "घंटा",
+        "hours": "घंटे",
+        "morning": "सुबह",
+        "afternoon": "दोपहर",
+        "evening": "शाम",
+        "night": "रात",
+        "humidity": "ह्यूमिडिटी",
+        "percent": "प्रतिशत",
+        "percentage": "प्रतिशत",
+        "ok": "ओके",
+        "okay": "ओके",
+        "please": "प्लीज़",
+        "sorry": "सॉरी",
+        "thank": "थैंक",
+        "thanks": "थैंक्स"
     ]
 
-    /// HEURISTIC: Transliterates known Romanized Hindi words into Devanagari while keeping
-    /// English words, numbers, and punctuation intact.
+    /// Converts numbers, temperatures, and clock times (e.g., "5 PM" -> "शाम 5 बजे", "24 degrees" -> "24 डिग्री")
+    /// into speakable Hindi/Devanagari form before token-level transliteration.
+    public static func normalizeSpeakableNumbersAndTimes(_ text: String) -> String {
+        var result = text
+
+        // 1. Multi-word place names (e.g., "New Delhi" -> "नई दिल्ली")
+        if let regex = try? NSRegularExpression(pattern: "\\bnew\\s+delhi\\b", options: [.caseInsensitive]) {
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: NSRange(result.startIndex..., in: result),
+                withTemplate: "नई दिल्ली"
+            )
+        }
+
+        // 2. Clock times with AM / PM (e.g. "5 PM" -> "शाम 5 बजे", "7:30 AM" -> "सुबह 7 बजकर 30 मिनट")
+        if let timeRegex = try? NSRegularExpression(
+            pattern: "\\b(\\d{1,2})(?::(\\d{2}))?\\s*([AaPp]\\.?[Mm]\\.?)\\b",
+            options: []
+        ) {
+            let matches = timeRegex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+            for match in matches.reversed() {
+                guard let fullRange = Range(match.range, in: result),
+                      let hourRange = Range(match.range(at: 1), in: result),
+                      let ampmRange = Range(match.range(at: 3), in: result),
+                      let hour = Int(result[hourRange]) else {
+                    continue
+                }
+
+                let minute: Int
+                if match.range(at: 2).location != NSNotFound,
+                   let minRange = Range(match.range(at: 2), in: result),
+                   let parsedMin = Int(result[minRange]) {
+                    minute = parsedMin
+                } else {
+                    minute = 0
+                }
+
+                let isPM = result[ampmRange].lowercased().hasPrefix("p")
+                let periodWord: String
+                if isPM {
+                    if hour == 12 || (hour >= 1 && hour <= 3) {
+                        periodWord = "दोपहर"
+                    } else if hour >= 4 && hour <= 7 {
+                        periodWord = "शाम"
+                    } else {
+                        periodWord = "रात"
+                    }
+                } else {
+                    if hour == 12 || (hour >= 1 && hour <= 3) {
+                        periodWord = "रात"
+                    } else {
+                        periodWord = "सुबह"
+                    }
+                }
+
+                let prefixCheck = result[..<fullRange.lowerBound].trimmingCharacters(in: .whitespaces).lowercased()
+                let hasLeadingPeriod = prefixCheck.hasSuffix("subah") || prefixCheck.hasSuffix("सुबह")
+                    || prefixCheck.hasSuffix("dopahar") || prefixCheck.hasSuffix("दोपहर")
+                    || prefixCheck.hasSuffix("shaam") || prefixCheck.hasSuffix("शाम")
+                    || prefixCheck.hasSuffix("raat") || prefixCheck.hasSuffix("रात")
+
+                let suffixCheck = result[fullRange.upperBound...].trimmingCharacters(in: .whitespaces).lowercased()
+                let hasTrailingBaje = suffixCheck.hasPrefix("baje") || suffixCheck.hasPrefix("बजे")
+
+                let effectivePrefix = hasLeadingPeriod ? "" : "\(periodWord) "
+                let spokenTime: String
+                if minute > 0 {
+                    spokenTime = "\(effectivePrefix)\(hour) बजकर \(minute) मिनट"
+                } else {
+                    let bajeSuffix = hasTrailingBaje ? "" : " बजे"
+                    spokenTime = "\(effectivePrefix)\(hour)\(bajeSuffix)"
+                }
+
+                result.replaceSubrange(fullRange, with: spokenTime)
+            }
+        }
+
+        // 3. Colon clock times without AM/PM (e.g. "7:30" -> "7 बजकर 30 मिनट", "7:00" -> "7 बजे")
+        if let colonTimeRegex = try? NSRegularExpression(pattern: "\\b(\\d{1,2}):(\\d{2})\\b", options: []) {
+            let matches = colonTimeRegex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+            for match in matches.reversed() {
+                guard let fullRange = Range(match.range, in: result),
+                      let hourRange = Range(match.range(at: 1), in: result),
+                      let minRange = Range(match.range(at: 2), in: result),
+                      let hour = Int(result[hourRange]),
+                      let minute = Int(result[minRange]) else {
+                    continue
+                }
+                let replacement = (minute > 0) ? "\(hour) बजकर \(minute) मिनट" : "\(hour) बजे"
+                result.replaceSubrange(fullRange, with: replacement)
+            }
+        }
+
+        // 4. Temperature and degree patterns (e.g. "24 degrees Celsius" -> "24 डिग्री सेल्सियस", "24 degrees" -> "24 डिग्री", "24°C" -> "24 डिग्री सेल्सियस")
+        let unitPatterns: [(String, String)] = [
+            ("(\\d+(?:\\.\\d+)?)\\s*°\\s*[Cc]\\b", "$1 डिग्री सेल्सियस"),
+            ("(\\d+(?:\\.\\d+)?)\\s*°\\s*[Ff]\\b", "$1 डिग्री फ़ारेनहाइट"),
+            ("(\\d+(?:\\.\\d+)?)\\s*degrees?\\s+celsius\\b", "$1 डिग्री सेल्सियस"),
+            ("(\\d+(?:\\.\\d+)?)\\s*degrees?\\s+fahrenheit\\b", "$1 डिग्री फ़ारेनहाइट"),
+            ("(\\d+(?:\\.\\d+)?)\\s*degrees?\\b", "$1 डिग्री"),
+            ("(\\d+(?:\\.\\d+)?)\\s*°", "$1 डिग्री"),
+            ("(\\d+(?:\\.\\d+)?)\\s*%", "$1 प्रतिशत")
+        ]
+
+        for (pattern, template) in unitPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    range: NSRange(result.startIndex..., in: result),
+                    withTemplate: template
+                )
+            }
+        }
+
+        return result
+    }
+
+    /// HEURISTIC: Normalizes numbers/times and transliterates Romanized Hindi words, Indian cities/places,
+    /// and common English assistant loanwords into Devanagari.
     public static func transliterate(_ text: String) -> String {
-        let lines = text.components(separatedBy: .newlines)
+        let normalized = normalizeSpeakableNumbersAndTimes(text)
+        let lines = normalized.components(separatedBy: .newlines)
         return lines.map { line in
             let tokens = line.split(separator: " ", omittingEmptySubsequences: false)
             return tokens.map { tokenSubstring in
@@ -616,42 +1042,31 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
 
     // MARK: - Voice Discovery Helpers
 
-    /// Returns installed English (`en-IN` first, then `en-US`/`en-GB`) and Hindi (`hi-IN`) voices,
-    /// hiding all other languages and sorting by quality (`Premium` > `Enhanced` > `Default`).
-    public nonisolated static func availableVoices() -> [TTSVoiceInfo] {
-        let filteredVoices = AVSpeechSynthesisVoice.speechVoices().compactMap { voice -> (TTSVoiceInfo, Int, Bool)? in
-            guard let priority = languagePriority(voice.language) else { return nil }
-            let isNovelty = voice.voiceTraits.contains(.isNoveltyVoice)
-            return (TTSVoiceInfo(voice: voice), priority, isNovelty)
-        }
+    /// Fixed Apple voice used for comparison: Isha (Premium, en-IN).
+    public static let ishaVoiceInfo = TTSVoiceInfo(
+        id: "com.apple.voice.premium.en-IN.Isha",
+        name: "Isha",
+        language: "en-IN",
+        quality: .premium
+    )
 
-        return filteredVoices.sorted { lhs, rhs in
-            if lhs.1 != rhs.1 {
-                return lhs.1 < rhs.1
-            }
-            if lhs.0.quality != rhs.0.quality {
-                return lhs.0.quality > rhs.0.quality
-            }
-            if lhs.2 != rhs.2 {
-                return !lhs.2
-            }
-            if lhs.0.language != rhs.0.language {
-                return lhs.0.language < rhs.0.language
-            }
-            return lhs.0.name < rhs.0.name
-        }.map(\.0)
+    /// Returns only `Isha (Premium, en-IN)` for comparison.
+    public nonisolated static func availableVoices() -> [TTSVoiceInfo] {
+        if let installedIsha = findInstalledIshaVoice() {
+            return [TTSVoiceInfo(voice: installedIsha)]
+        }
+        return [ishaVoiceInfo]
     }
 
-    /// Selects the best installed voice for the given primary and fallback language codes,
-    /// preferring `.premium` > `.enhanced` > `.default`.
+    /// Returns `Isha (Premium, en-IN)` metadata.
     public nonisolated static func bestVoiceInfo(
         primaryLanguage: String,
         fallbackLanguage: String
     ) -> TTSVoiceInfo? {
-        if let voice = selectBestAVVoice(primaryLanguage: primaryLanguage, fallbackLanguage: fallbackLanguage) {
-            return TTSVoiceInfo(voice: voice)
+        if let installedIsha = findInstalledIshaVoice() {
+            return TTSVoiceInfo(voice: installedIsha)
         }
-        return nil
+        return ishaVoiceInfo
     }
 
     fileprivate nonisolated static func selectBestAVVoice(
@@ -659,63 +1074,25 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
         fallbackLanguage: String,
         identifierOverride: String? = nil
     ) -> AVSpeechSynthesisVoice? {
-        if let identifierOverride,
-           !identifierOverride.isEmpty,
-           let explicitVoice = AVSpeechSynthesisVoice(identifier: identifierOverride) {
-            return explicitVoice
+        if let installedIsha = findInstalledIshaVoice() {
+            return installedIsha
         }
-
-        let installed = AVSpeechSynthesisVoice.speechVoices()
-
-        if let bestPrimary = bestMatchingVoice(in: installed, forLanguage: primaryLanguage) {
-            return bestPrimary
+        if let explicitIsha = AVSpeechSynthesisVoice(identifier: ishaVoiceInfo.id) {
+            return explicitIsha
         }
-
-        if let bestFallback = bestMatchingVoice(in: installed, forLanguage: fallbackLanguage) {
-            return bestFallback
-        }
-
-        return AVSpeechSynthesisVoice(language: primaryLanguage)
+        return AVSpeechSynthesisVoice(language: "en-IN")
+            ?? AVSpeechSynthesisVoice(language: primaryLanguage)
             ?? AVSpeechSynthesisVoice(language: fallbackLanguage)
     }
 
-    private nonisolated static func bestMatchingVoice(
-        in voices: [AVSpeechSynthesisVoice],
-        forLanguage languageCode: String
-    ) -> AVSpeechSynthesisVoice? {
-        let target = languageCode.lowercased()
-        let matches = voices.filter { $0.language.lowercased() == target }
-        guard !matches.isEmpty else { return nil }
-
-        return matches.sorted { lhs, rhs in
-            let lhsRank = TTSVoiceInfo.QualityTier(avQuality: lhs.quality)
-            let rhsRank = TTSVoiceInfo.QualityTier(avQuality: rhs.quality)
-            if lhsRank != rhsRank {
-                return lhsRank > rhsRank
-            }
-            let lhsNovelty = lhs.voiceTraits.contains(.isNoveltyVoice)
-            let rhsNovelty = rhs.voiceTraits.contains(.isNoveltyVoice)
-            if lhsNovelty != rhsNovelty {
-                return !lhsNovelty
-            }
-            return lhs.name < rhs.name
-        }.first
-    }
-
-    /// Returns the sort priority for allowed languages (`en-IN` first, `hi-IN`, then `en-US`/`en-GB`/other `en-*`),
-    /// or `nil` for all other languages so they are hidden.
-    private nonisolated static func languagePriority(_ language: String) -> Int? {
-        let normalized = language.lowercased().replacingOccurrences(of: "_", with: "-")
-        switch normalized {
-        case "en-in": return 0
-        case "hi-in": return 1
-        case "en-us": return 2
-        case "en-gb": return 3
-        default:
-            if normalized.hasPrefix("hi") { return 1 }
-            if normalized.hasPrefix("en") { return 4 }
-            return nil
+    private nonisolated static func findInstalledIshaVoice() -> AVSpeechSynthesisVoice? {
+        let ishaVoices = AVSpeechSynthesisVoice.speechVoices().filter { voice in
+            let lang = voice.language.lowercased().replacingOccurrences(of: "_", with: "-")
+            return lang == "en-in" && voice.name.lowercased().contains("isha")
         }
+        return ishaVoices.sorted { lhs, rhs in
+            TTSVoiceInfo.QualityTier(avQuality: lhs.quality) > TTSVoiceInfo.QualityTier(avQuality: rhs.quality)
+        }.first
     }
 
     // MARK: - Off-Main-Thread Audio Session Configuration
@@ -904,6 +1281,17 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
             ))
             context.onFirstAudio?(firstAudioMs)
         }
+
+        print(String(
+            format: "[TTS DEBUG] engine=Apple speaker=%@ (%@, %@) strategy=%@ firstAudioMs=%.0f synthMs=%.0f rtf=0.00 text=%@",
+            context.voiceIdentifier,
+            context.voiceName,
+            context.voiceLanguage,
+            context.strategyLabel,
+            firstAudioMs,
+            firstAudioMs,
+            context.spokenText.debugDescription
+        ))
 
         let metrics = TTSSynthesisMetrics(
             firstAudioMs: firstAudioMs,

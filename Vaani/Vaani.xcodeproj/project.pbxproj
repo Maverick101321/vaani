@@ -24,12 +24,6 @@
 			path = Vaani;
 			sourceTree = "<group>";
 		};
-		8BB661303084429D00A93C22 /* kokoro-int8-multi-lang-v1_0 */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			name = "kokoro-int8-multi-lang-v1_0";
-			path = "Staging/kokoro-int8-multi-lang-v1_0";
-			sourceTree = "<group>";
-		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -47,7 +41,6 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				8BB661303084429D00A93C22 /* kokoro-int8-multi-lang-v1_0 */,
 				000000000000000000000010 /* Vaani */,
 				8BB65F8430843BD700A93C22 /* Frameworks */,
 				000000000000000000000020 /* Products */,
@@ -81,12 +74,12 @@
 				000000000000000120000000 /* Sources */,
 				000000000000000130000000 /* Frameworks */,
 				000000000000000140000000 /* Resources */,
+				8BB662AC3084C4D400A93C22 /* ShellScript */,
 			);
 			buildRules = (
 			);
 			fileSystemSynchronizedGroups = (
 				000000000000000000000010 /* Vaani */,
-				8BB661303084429D00A93C22 /* kokoro-int8-multi-lang-v1_0 */,
 			);
 			name = Vaani;
 			packageProductDependencies = (
@@ -140,6 +133,19 @@
 			);
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		8BB662AC3084C4D400A93C22 /* ShellScript */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			shellPath = /bin/sh;
+			shellScript = (
+				"# Type a script or drag a script file from your workspace to insert its path.",
+				"   rsync -a --delete \"$SRCROOT/Staging/kokoro-int8-multi-lang-v1_0/\" \"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/kokoro-int8-multi-lang-v1_0/\"",
+				"",
+			);
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		000000000000000120000000 /* Sources */ = {
@@ -290,6 +296,7 @@
 				DEVELOPMENT_TEAM = G36M242925;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Vaani needs the microphone to hear your voice commands.";
@@ -331,6 +338,7 @@
 				DEVELOPMENT_TEAM = G36M242925;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Vaani needs the microphone to hear your voice commands.";

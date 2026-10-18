@@ -7,9 +7,13 @@ public struct LatencyMetrics: Equatable, Sendable {
     public var llmMs: Double
     /// Time until TTS audio begins (time-to-first-audio).
     public var ttsMs: Double
-    /// Explicit time-to-first-audio in ms (from `didStart` delegate callback).
+    /// Explicit time-to-first-audio in ms (first scheduled buffer or `didStart` delegate callback).
     public var ttsFirstAudioMs: Double
-    /// Total TTS playback duration in ms (until `didFinish`).
+    /// Total TTS synthesis time in ms (for neural TTS engines like Kokoro).
+    public var ttsSynthMs: Double
+    /// Real-time factor (`synthSeconds / audioDurationSeconds`) for neural TTS.
+    public var ttsRTF: Double
+    /// Total TTS playback duration in ms (until audio finishes playing).
     public var ttsTotalDurationMs: Double
     public var totalMs: Double
     
@@ -18,6 +22,8 @@ public struct LatencyMetrics: Equatable, Sendable {
         llmMs: Double = 0,
         ttsMs: Double = 0,
         ttsFirstAudioMs: Double = 0,
+        ttsSynthMs: Double = 0,
+        ttsRTF: Double = 0,
         ttsTotalDurationMs: Double = 0,
         totalMs: Double = 0
     ) {
@@ -25,6 +31,8 @@ public struct LatencyMetrics: Equatable, Sendable {
         self.llmMs = llmMs
         self.ttsMs = ttsMs
         self.ttsFirstAudioMs = ttsFirstAudioMs > 0 ? ttsFirstAudioMs : ttsMs
+        self.ttsSynthMs = ttsSynthMs
+        self.ttsRTF = ttsRTF
         self.ttsTotalDurationMs = ttsTotalDurationMs
         self.totalMs = totalMs
     }
@@ -87,12 +95,41 @@ public final class VoiceAgentViewModel {
     /// Selected language (English or Hinglish).
     public var language: Language = .english
     
-    /// Selected Hinglish TTS strategy (defaults to `.romanizedHiIN`).
+    /// Selected TTS engine (used in TTS Lab; main agent routes Hinglish -> Kokoro and English -> Apple, falling back to Apple if Kokoro fails to load).
+    public var ttsEngine: TTSEngine = .kokoro
+    
+    /// Selected Kokoro Hinglish strategy (locked-in default `.k2DevanagariMixHi` with Hindi voice `hf_beta`).
+    public var kokoroStrategy: KokoroStrategy = .k2DevanagariMixHi {
+        didSet {
+            kokoroTTS.hinglishStrategy = kokoroStrategy
+        }
+    }
+    
+    /// Selected Kokoro speaker ID for Hindi/Hinglish (locked-in default `32` `hf_beta`).
+    public var kokoroHindiSpeakerID: Int = KokoroSpeaker.defaultHindiSpeakerID {
+        didSet {
+            kokoroTTS.hindiSpeakerID = kokoroHindiSpeakerID
+        }
+    }
+    
+    /// Selected Kokoro speaker ID for English (defaults to `3` `af_heart`).
+    public var kokoroEnglishSpeakerID: Int = KokoroSpeaker.defaultEnglishSpeakerID {
+        didSet {
+            kokoroTTS.englishSpeakerID = kokoroEnglishSpeakerID
+        }
+    }
+    
+    /// Selected Kokoro speech speed (`0.8 ... 1.3`, defaults to `1.0`).
+    public var kokoroSpeed: Float = 1.0 {
+        didSet {
+            kokoroTTS.speed = kokoroSpeed
+        }
+    }
+    
+    /// Selected Apple Hinglish TTS strategy (defaults to `.romanizedHiIN`).
     public var ttsStrategy: TTSStrategy = .romanizedHiIN {
         didSet {
-            if let appleTTS = ttsClient as? AppleTTS {
-                appleTTS.hinglishStrategy = ttsStrategy
-            }
+            appleTTS.hinglishStrategy = ttsStrategy
         }
     }
     
@@ -121,6 +158,13 @@ public final class VoiceAgentViewModel {
     public var isSTTReady: Bool {
         sttLoadingState == .ready
     }
+
+    /// Load lifecycle for the bundled on-device Kokoro TTS model.
+    public var kokoroLoadingState: KokoroLoadingState = .loading
+
+    public var isKokoroReady: Bool {
+        kokoroLoadingState == .ready
+    }
     
     // MARK: - Dependencies & Private State
     
@@ -128,6 +172,8 @@ public final class VoiceAgentViewModel {
     public let sttClient: SpeechToText
     public let llmClient: LLMClient
     public let ttsClient: TextToSpeech
+    public let kokoroTTS: KokoroTTS
+    public let appleTTS: AppleTTS
     
     /// Cached audio samples from the last recorded utterance.
     public private(set) var lastAudioSamples: [Float] = []
@@ -140,35 +186,53 @@ public final class VoiceAgentViewModel {
         audioRecorder: AudioRecorder = AudioRecorder(),
         sttClient: SpeechToText = WhisperKitSTT(),
         llmClient: LLMClient = MockLLMClient(),
-        ttsClient: TextToSpeech = AppleTTS()
+        ttsClient: TextToSpeech = KokoroTTS(),
+        appleFallbackTTS: AppleTTS = AppleTTS()
     ) {
         self.audioRecorder = audioRecorder
         self.sttClient = sttClient
         self.llmClient = llmClient
         self.ttsClient = ttsClient
+        self.kokoroTTS = (ttsClient as? KokoroTTS) ?? KokoroTTS()
+        self.appleTTS = (ttsClient as? AppleTTS) ?? appleFallbackTTS
         
         // Link real-time audio meter updates directly to view model property
         audioRecorder.onLevelChange = { [weak self] level in
             self?.audioLevel = level
         }
 
-        if let appleTTS = ttsClient as? AppleTTS {
-            appleTTS.hinglishStrategy = ttsStrategy
-            appleTTS.onFirstAudio = { [weak self] firstAudioMs in
-                guard let self else { return }
-                self.latency.ttsFirstAudioMs = firstAudioMs
-                self.latency.ttsMs = firstAudioMs
-                self.latency.totalMs = self.latency.sttMs + self.latency.llmMs + firstAudioMs
-            }
+        kokoroTTS.hinglishStrategy = kokoroStrategy
+        kokoroTTS.hindiSpeakerID = kokoroHindiSpeakerID
+        kokoroTTS.englishSpeakerID = kokoroEnglishSpeakerID
+        kokoroTTS.speed = kokoroSpeed
+        kokoroTTS.onFirstAudio = { [weak self] firstAudioMs in
+            guard let self else { return }
+            self.latency.ttsFirstAudioMs = firstAudioMs
+            self.latency.ttsMs = firstAudioMs
+            self.latency.totalMs = self.latency.sttMs + self.latency.llmMs + firstAudioMs
+        }
+
+        appleTTS.hinglishStrategy = ttsStrategy
+        appleTTS.onFirstAudio = { [weak self] firstAudioMs in
+            guard let self else { return }
+            self.latency.ttsFirstAudioMs = firstAudioMs
+            self.latency.ttsMs = firstAudioMs
+            self.latency.totalMs = self.latency.sttMs + self.latency.llmMs + firstAudioMs
         }
 
         if !(sttClient is WhisperKitSTT) {
             sttLoadingState = .ready
         }
+
+        if !(ttsClient is KokoroTTS) {
+            kokoroLoadingState = .ready
+        }
     }
 
-    /// Starts model setup once the app UI has appeared.
+    /// Starts STT and Kokoro TTS model setup asynchronously once the app UI has appeared.
     public func prepareSpeechToText() {
+        prepareTextToSpeech()
+
         guard let whisperSTT = sttClient as? WhisperKitSTT, !isSTTReady else { return }
 
         Task { [weak self] in
@@ -182,6 +246,26 @@ public final class VoiceAgentViewModel {
             } catch {
                 // The state callback already contains a concise user-facing failure reason.
                 print("WhisperKit model preparation error: \(error)")
+            }
+        }
+    }
+
+    /// Loads the bundled Kokoro multi-lang TTS model asynchronously; falls back to AppleTTS if loading fails.
+    public func prepareTextToSpeech() {
+        guard !isKokoroReady else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.kokoroTTS.prepare { [weak self] state in
+                    guard let self else { return }
+                    self.kokoroLoadingState = state
+                    if case .failed = state {
+                        self.ttsEngine = .apple
+                    }
+                }
+            } catch {
+                print("Kokoro TTS model preparation error (falling back to AppleTTS): \(error)")
             }
         }
     }
@@ -204,6 +288,8 @@ public final class VoiceAgentViewModel {
     /// Begins recording audio from the microphone.
     public func startListening() {
         activeTask?.cancel()
+        kokoroTTS.stop()
+        appleTTS.stop()
         ttsClient.stop()
         errorMessage = nil
         state = .listening
@@ -240,7 +326,7 @@ public final class VoiceAgentViewModel {
             let generatedAnswer = await ask(prompt: transcribedText)
             guard !Task.isCancelled else { return }
             
-            // 3. Speak response (updates latency.ttsMs on didStart and returns to .idle on completion)
+            // 3. Speak response (updates latency.ttsMs on first scheduled buffer / didStart and returns to .idle on completion)
             await speak(text: generatedAnswer)
             guard !Task.isCancelled else { return }
             
@@ -254,6 +340,8 @@ public final class VoiceAgentViewModel {
         activeTask?.cancel()
         activeTask = nil
         _ = audioRecorder.stop()
+        kokoroTTS.stop()
+        appleTTS.stop()
         ttsClient.stop()
         audioLevel = 0.0
         state = .idle
@@ -311,8 +399,10 @@ public final class VoiceAgentViewModel {
         return generated
     }
     
-    /// Synthesizes and speaks the given response text.
-    /// `latency.ttsMs` records time-to-first-audio (`didStart`), while `latency.ttsTotalDurationMs` records full speech duration.
+    /// Synthesizes and speaks the given response text using the locked-in TTS configuration:
+    /// - **Hinglish mode**: Kokoro (`hf_beta`, strategy `K2` Devanagari mix, `lang = "hi"`), falling back to Apple TTS if Kokoro fails to load.
+    /// - **English mode**: Apple `AVSpeechSynthesizer` (`Isha (Premium, en-IN)`).
+    /// `latency.ttsMs` records time-to-first-audio, while `latency.ttsTotalDurationMs` records full speech duration.
     /// - Parameter text: Response text to synthesize. Defaults to nil (uses current response).
     public func speak(text: String? = nil) async {
         state = .speaking
@@ -320,15 +410,37 @@ public final class VoiceAgentViewModel {
         
         let inputSpeech = text ?? self.response
         do {
-            if let appleTTS = ttsClient as? AppleTTS {
+            if language == .hinglish && kokoroTTS.isReady {
+                kokoroTTS.hinglishStrategy = .k2DevanagariMixHi
+                kokoroTTS.hindiSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
+                kokoroTTS.speed = kokoroSpeed
+
+                let metrics = try await kokoroTTS.speakWithMetrics(
+                    text: inputSpeech,
+                    language: .hinglish,
+                    strategyOverride: .k2DevanagariMixHi,
+                    speakerIDOverride: KokoroSpeaker.defaultHindiSpeakerID,
+                    speedOverride: kokoroSpeed
+                )
+                latency.ttsFirstAudioMs = metrics.firstAudioMs
+                latency.ttsMs = metrics.firstAudioMs
+                latency.ttsSynthMs = metrics.synthMs
+                latency.ttsRTF = metrics.rtf
+                latency.ttsTotalDurationMs = metrics.totalDurationMs
+                latency.totalMs = latency.sttMs + latency.llmMs + metrics.firstAudioMs
+            } else if (ttsClient is KokoroTTS) || (ttsClient is AppleTTS) {
+                // English mode (Isha Premium en-IN) or automatic AppleTTS fallback if Kokoro is not ready in Hinglish mode
                 appleTTS.hinglishStrategy = ttsStrategy
                 let metrics = try await appleTTS.speakWithMetrics(
                     text: inputSpeech,
                     language: language,
-                    strategyOverride: language == .hinglish ? ttsStrategy : nil
+                    strategyOverride: language == .hinglish ? ttsStrategy : nil,
+                    voiceIdentifierOverride: language == .english ? AppleTTS.ishaVoiceInfo.id : nil
                 )
                 latency.ttsFirstAudioMs = metrics.firstAudioMs
                 latency.ttsMs = metrics.firstAudioMs
+                latency.ttsSynthMs = metrics.firstAudioMs
+                latency.ttsRTF = 0.0
                 latency.ttsTotalDurationMs = metrics.totalDurationMs
                 latency.totalMs = latency.sttMs + latency.llmMs + metrics.firstAudioMs
             } else {
