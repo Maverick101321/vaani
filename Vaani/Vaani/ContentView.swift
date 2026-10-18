@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var viewModel = VoiceAgentViewModel()
+    @State private var isShowingTTSLab = false
     
     var body: some View {
         NavigationStack {
@@ -34,6 +35,19 @@ struct ContentView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Vaani")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        isShowingTTSLab = true
+                    } label: {
+                        Label("TTS Lab", systemImage: "speaker.wave.2.bubble.left.fill")
+                            .font(.subheadline.weight(.medium))
+                    }
+                }
+            }
+            .sheet(isPresented: $isShowingTTSLab) {
+                TTSLabView(viewModel: viewModel)
+            }
         }
         .task {
             viewModel.prepareSpeechToText()
@@ -43,20 +57,56 @@ struct ContentView: View {
     // MARK: - Header & Language
     
     private var headerSection: some View {
-        HStack {
-            Label("Voice Agent", systemImage: "waveform.circle.fill")
-                .font(.headline)
-                .foregroundStyle(.secondary)
-            
-            Spacer()
-            
-            Picker("Language", selection: $viewModel.language) {
-                ForEach(VoiceAgentViewModel.Language.allCases) { lang in
-                    Text(lang.rawValue).tag(lang)
+        VStack(spacing: 12) {
+            HStack {
+                Label("Voice Agent", systemImage: "waveform.circle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
+                
+                Spacer()
+                
+                Button {
+                    isShowingTTSLab = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "slider.horizontal.3")
+                        Text("TTS Lab")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
                 }
+                
+                Picker("Language", selection: $viewModel.language) {
+                    ForEach(VoiceAgentViewModel.Language.allCases) { lang in
+                        Text(lang.rawValue).tag(lang)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 165)
             }
-            .pickerStyle(.segmented)
-            .frame(width: 170)
+            
+            if viewModel.language == .hinglish {
+                HStack {
+                    Text("Hinglish TTS:")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    
+                    Picker("Hinglish TTS Strategy", selection: $viewModel.ttsStrategy) {
+                        ForEach(TTSStrategy.allCases) { strategy in
+                            Text(strategy.displayName).tag(strategy)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(.caption)
+                    
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
         }
     }
     
@@ -187,15 +237,23 @@ struct ContentView: View {
     
     private var latencySection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Latency Breakdown")
-                .font(.caption.weight(.bold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
+            HStack {
+                Text("Latency Breakdown")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+                if viewModel.latency.ttsTotalDurationMs > 0 {
+                    Text(String(format: "TTS Play: %.0f ms", viewModel.latency.ttsTotalDurationMs))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
             
             HStack(spacing: 10) {
                 latencyMetricPill(label: "STT", ms: viewModel.latency.sttMs)
                 latencyMetricPill(label: "LLM", ms: viewModel.latency.llmMs)
-                latencyMetricPill(label: "TTS", ms: viewModel.latency.ttsMs)
+                latencyMetricPill(label: "TTS 1st", ms: viewModel.latency.ttsMs)
                 latencyMetricPill(label: "Total", ms: viewModel.latency.totalMs, isHighlighted: true)
             }
         }
@@ -338,6 +396,373 @@ struct ContentView: View {
         .padding(12)
         .background(Color.red.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+// MARK: - TTS Comparison Lab Screen
+
+struct TTSLabView: View {
+    @Bindable var viewModel: VoiceAgentViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var customText: String = "Aaj mausam bilkul suhana hai, lagbhag 24 degrees."
+    @State private var selectedVoiceID: String = "" //Empty string = Auto (Best for Strategy)
+    @State private var installedVoices: [TTSVoiceInfo] = []
+    @State private var isPlaying: Bool = false
+    @State private var firstAudioMs: Double?
+    @State private var totalDurationMs: Double?
+    @State private var lastSpokenVoiceLabel: String?
+    @State private var lastSpokenText: String?
+    @State private var playTask: Task<Void, Never>?
+
+    private static let assignmentSentences: [String] = [
+        "What is the weather forecast for Bangalore tomorrow?",
+        "Can you set a reminder for my meeting at 5 PM?",
+        "Mujhe kal subah 7 baje ka alarm set karna hai.",
+        "Aaj ka schedule kya hai, aur meri next meeting kab hai?"
+    ]
+
+    private static let hinglishReplies: [String] = [
+        "Aaj mausam bilkul suhana hai, lagbhag 24 degrees.",
+        "Aapka alarm kal subah 7 baje ke liye set ho gaya hai.",
+        "Kal Bangalore mein halka baarish hone ka chance hai, temperature 24 degrees rahega.",
+        "Aaj aapke schedule mein 3 meetings hain, aur next meeting shaam 5 baje hai."
+    ]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    // 1. Strategy Picker
+                    strategyCard
+
+                    // 2. Voice Picker
+                    voicePickerCard
+
+                    // 3. Text Input & Transliteration Preview
+                    textInputCard
+
+                    // 4. Play Button & Latency Readout
+                    playbackAndMetricsCard
+
+                    // 5. Preset Sentence Buttons
+                    presetsSection
+                }
+                .padding(20)
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("TTS Comparison Lab")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        stopPlayback()
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                }
+            }
+        }
+        .onAppear {
+            installedVoices = AppleTTS.availableVoices()
+        }
+        .onDisappear {
+            stopPlayback()
+        }
+    }
+
+    // MARK: - Sections
+
+    private var strategyCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Hinglish Strategy", systemImage: "Character.bubble.fill")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+
+            Picker("Strategy", selection: $viewModel.ttsStrategy) {
+                ForEach(TTSStrategy.allCases) { strategy in
+                    Text(strategy.displayName).tag(strategy)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(viewModel.ttsStrategy.subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var voicePickerCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Installed Voices", systemImage: "person.wave.2.fill")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+
+                Spacer()
+
+                Text("\(installedVoices.count) voices")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Picker("Select Voice", selection: $selectedVoiceID) {
+                Text(autoVoiceDescription).tag("")
+                ForEach(installedVoices) { voice in
+                    Text(voice.displayLabel).tag(voice.id)
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(uiColor: .tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var autoVoiceDescription: String {
+        let pair = viewModel.ttsStrategy.languagePreference
+        if let best = AppleTTS.bestVoiceInfo(primaryLanguage: pair.primary, fallbackLanguage: pair.fallback) {
+            return "Auto (Best: \(best.displayLabel))"
+        }
+        return "Auto (Best for \(pair.primary))"
+    }
+
+    private var textInputCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Utterance Text", systemImage: "text.bubble.fill")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+
+                Spacer()
+
+                if !customText.isEmpty {
+                    Button("Clear") {
+                        customText = ""
+                    }
+                    .font(.caption)
+                }
+            }
+
+            TextField("Enter English or Hinglish text to synthesize...", text: $customText, axis: .vertical)
+                .lineLimit(3...6)
+                .padding(12)
+                .background(Color(uiColor: .tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            if viewModel.ttsStrategy == .devanagariHiIN && !customText.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Strategy C Heuristic Devanagari Preview:")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(HinglishTransliterator.transliterate(customText))
+                        .font(.footnote)
+                        .foregroundStyle(.blue)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.blue.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+        }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var playbackAndMetricsCard: some View {
+        VStack(spacing: 14) {
+            Button {
+                if isPlaying {
+                    stopPlayback()
+                } else {
+                    playCurrentText()
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: isPlaying ? "stop.fill" : "play.fill")
+                        .font(.headline)
+                    Text(isPlaying ? "Stop Playback" : "Play Utterance")
+                        .font(.headline)
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(isPlaying ? Color.red : Color.blue)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .disabled(customText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isPlaying)
+
+            HStack(spacing: 12) {
+                metricBox(
+                    title: "Time to First Audio",
+                    value: firstAudioMs.map { String(format: "%.0f ms", $0) } ?? "--",
+                    highlighted: true
+                )
+
+                metricBox(
+                    title: "Total Duration",
+                    value: totalDurationMs.map { String(format: "%.0f ms", $0) } ?? "--",
+                    highlighted: false
+                )
+            }
+
+            if let voiceLabel = lastSpokenVoiceLabel {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Last Voice: \(voiceLabel)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    if let spoken = lastSpokenText {
+                        Text("Spoken: \"\(spoken)\"")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func metricBox(title: String, value: String, highlighted: Bool) -> some View {
+        VStack(spacing: 4) {
+            Text(title)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.weight(.bold).monospacedDigit())
+                .foregroundStyle(highlighted ? Color.blue : Color.primary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(
+            highlighted
+                ? Color.blue.opacity(0.1)
+                : Color(uiColor: .tertiarySystemGroupedBackground)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var presetsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            presetGroup(
+                title: "Assignment Example Sentences",
+                icon: "doc.text.fill",
+                sentences: Self.assignmentSentences
+            )
+
+            presetGroup(
+                title: "Hinglish Agent Replies",
+                icon: "bubble.left.and.bubble.right.fill",
+                sentences: Self.hinglishReplies
+            )
+        }
+    }
+
+    private func presetGroup(title: String, icon: String, sentences: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(title, systemImage: icon)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+
+            ForEach(sentences, id: \.self) { sentence in
+                Button {
+                    customText = sentence
+                    playCurrentText()
+                } label: {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "play.circle.fill")
+                            .foregroundStyle(Color.accentColor)
+                            .font(.body)
+                        Text(sentence)
+                            .font(.subheadline)
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
+                        Spacer()
+                    }
+                    .padding(12)
+                    .background(Color(uiColor: .tertiarySystemGroupedBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    // MARK: - Playback Actions
+
+    private func playCurrentText() {
+        playTask?.cancel()
+        viewModel.reset()
+
+        let textToSpeak = customText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !textToSpeak.isEmpty else { return }
+
+        let chosenStrategy = viewModel.ttsStrategy
+        let voiceOverride = selectedVoiceID.isEmpty ? nil : selectedVoiceID
+
+        isPlaying = true
+        firstAudioMs = nil
+        totalDurationMs = nil
+
+        playTask = Task {
+            let appleTTS = (viewModel.ttsClient as? AppleTTS) ?? AppleTTS(hinglishStrategy: chosenStrategy)
+            let previousFirstAudioHandler = appleTTS.onFirstAudio
+
+            appleTTS.onFirstAudio = { ms in
+                self.firstAudioMs = ms
+                previousFirstAudioHandler?(ms)
+            }
+
+            defer {
+                appleTTS.onFirstAudio = previousFirstAudioHandler
+                if !Task.isCancelled {
+                    isPlaying = false
+                }
+            }
+
+            do {
+                let metrics = try await appleTTS.speakWithMetrics(
+                    text: textToSpeak,
+                    language: .hinglish,
+                    strategyOverride: chosenStrategy,
+                    voiceIdentifierOverride: voiceOverride
+                )
+                guard !Task.isCancelled else { return }
+                self.firstAudioMs = metrics.firstAudioMs
+                self.totalDurationMs = metrics.totalDurationMs
+                self.lastSpokenVoiceLabel = "\(metrics.voiceName) (\(metrics.voiceLanguage)) • \(metrics.voiceQuality) [\(metrics.voiceIdentifier)]"
+                self.lastSpokenText = metrics.spokenText
+            } catch is CancellationError {
+                // Stopped by user
+            } catch {
+                print("TTS Lab playback error: \(error)")
+            }
+        }
+    }
+
+    private func stopPlayback() {
+        playTask?.cancel()
+        playTask = nil
+        viewModel.ttsClient.stop()
+        isPlaying = false
     }
 }
 

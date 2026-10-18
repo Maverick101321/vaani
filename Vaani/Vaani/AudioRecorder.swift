@@ -43,9 +43,11 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
     
     // MARK: - Concurrency & Synchronization
     
-    /// Dedicated serial queue for all AVAudioSession configuration, setActive calls,
-    /// and AVAudioEngine start/stop operations to avoid main thread hang risk.
-    private let audioQueue = DispatchQueue(label: "com.vaani.AudioRecorder.audioQueue", qos: .userInitiated)
+    /// Shared serial queue for all AVAudioSession configuration, setActive calls,
+    /// AVAudioEngine start/stop operations, and TTS session transitions off the main thread.
+    public static let sharedAudioSessionQueue = DispatchQueue(label: "com.vaani.AudioSessionQueue", qos: .userInitiated)
+    
+    private let audioQueue: DispatchQueue = AudioRecorder.sharedAudioSessionQueue
     
     private let lock = NSLock()
     private var recordedSamples: [Float] = []
@@ -120,8 +122,11 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
         
         #if os(iOS) || os(visionOS)
         let audioSession = AVAudioSession.sharedInstance()
-        // Mode changed to .voiceChat
-        try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
+        try audioSession.setCategory(
+            .playAndRecord,
+            mode: .voiceChat,
+            options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+        )
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         #endif
         
@@ -161,7 +166,7 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
             hasInstalledTap = false
         }
         
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+        try inputNode.__installTap(onBus: 0, bufferSize: 1024, format: inputFormat, error: ()) { [weak self] buffer, _ in
             guard let self = self else { return }
             
             // 1. Compute RMS from raw input buffer inside installTap BEFORE any resampling
@@ -275,7 +280,7 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
         }
     }
     
-    /// Tears down the audio engine and deactivates AVAudioSession off the main thread.
+    /// Tears down the audio engine and prepares AVAudioSession for speaker playback off the main thread.
     /// Runs exclusively on audioQueue.
     private func performStop() {
         guard isEngineActive || audioEngine != nil else { return }
@@ -288,14 +293,20 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
             if engine.isRunning {
                 engine.stop()
             }
+            engine.reset()
             self.audioEngine = nil
         }
         
         #if os(iOS) || os(visionOS)
         do {
-            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: .default,
+                options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+            )
         } catch {
-            print("[AudioRecorder DEBUG] AVAudioSession setActive(false) failed: \(error)")
+            print("[AudioRecorder DEBUG] AVAudioSession transition after stop failed: \(error)")
         }
         #endif
         

@@ -8,16 +8,26 @@
 
 /* Begin PBXBuildFile section */
 		8BB65F7F3083840200A93C22 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 8BB65F7E3083840200A93C22 /* WhisperKit */; };
+		8BB65F8630843BD800A93C22 /* sherpa-onnx.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8BB65F8530843BD800A93C22 /* sherpa-onnx.xcframework */; };
+		8BB65F8A30843D3500A93C22 /* onnxruntime.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8BB65F8930843D3500A93C22 /* onnxruntime.xcframework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* Vaani.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Vaani.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		8BB65F8530843BD800A93C22 /* sherpa-onnx.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = "sherpa-onnx.xcframework"; path = "Staging/build-ios/sherpa-onnx.xcframework"; sourceTree = "<group>"; };
+		8BB65F8930843D3500A93C22 /* onnxruntime.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = onnxruntime.xcframework; path = "Staging/build-ios/ios-onnxruntime/1.27.0/onnxruntime.xcframework"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		000000000000000000000010 /* Vaani */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Vaani;
+			sourceTree = "<group>";
+		};
+		8BB661303084429D00A93C22 /* kokoro-int8-multi-lang-v1_0 */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			name = "kokoro-int8-multi-lang-v1_0";
+			path = "Staging/kokoro-int8-multi-lang-v1_0";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -27,6 +37,8 @@
 			isa = PBXFrameworksBuildPhase;
 			files = (
 				8BB65F7F3083840200A93C22 /* WhisperKit in Frameworks */,
+				8BB65F8630843BD800A93C22 /* sherpa-onnx.xcframework in Frameworks */,
+				8BB65F8A30843D3500A93C22 /* onnxruntime.xcframework in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -35,7 +47,9 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
+				8BB661303084429D00A93C22 /* kokoro-int8-multi-lang-v1_0 */,
 				000000000000000000000010 /* Vaani */,
+				8BB65F8430843BD700A93C22 /* Frameworks */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -46,6 +60,15 @@
 				000000000000000000000120 /* Vaani.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		8BB65F8430843BD700A93C22 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				8BB65F8930843D3500A93C22 /* onnxruntime.xcframework */,
+				8BB65F8530843BD800A93C22 /* sherpa-onnx.xcframework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -63,6 +86,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				000000000000000000000010 /* Vaani */,
+				8BB661303084429D00A93C22 /* kokoro-int8-multi-lang-v1_0 */,
 			);
 			name = Vaani;
 			packageProductDependencies = (
@@ -282,6 +306,7 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = "-lc++";
 				PRODUCT_BUNDLE_IDENTIFIER = com.varunchoudharypersonalteam.Vaani;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -291,6 +316,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Vaani/SherpaOnnx-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
@@ -321,6 +347,7 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = "-lc++";
 				PRODUCT_BUNDLE_IDENTIFIER = com.varunchoudharypersonalteam.Vaani;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -330,6 +357,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Vaani/SherpaOnnx-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
