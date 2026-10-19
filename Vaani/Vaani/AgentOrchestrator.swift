@@ -59,9 +59,44 @@ private actor ConversationHistoryStore {
     }
 }
 
+/// Thread-safe tracker that remembers the first working fallback chain entry index for the current session.
+nonisolated private final class SessionChainTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var workingIndex: Int?
+    private var didRunSelfTest: Bool = false
+
+    func preferredStartIndex(chainCount: Int) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let idx = workingIndex, idx >= 0, idx < chainCount else {
+            return 0
+        }
+        return idx
+    }
+
+    func recordFirstWorkingIndex(_ index: Int) {
+        lock.lock()
+        if workingIndex == nil {
+            workingIndex = index
+        }
+        lock.unlock()
+    }
+
+    func markSelfTestStartedIfNeeded() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if didRunSelfTest {
+            return false
+        }
+        didRunSelfTest = true
+        return true
+    }
+}
+
 /// Orchestrates the multi-turn voice agent loop:
 /// - Maintains the last 6 conversation turns
-/// - Streams from `[Groq, Gemini]` with automatic provider fallback on 404/model-not-found/429/5xx/8s timeout
+/// - Streams across the ordered fallback chain (`openai/gpt-oss-120b` -> `openai/gpt-oss-20b` -> `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite`),
+///   advancing on 404/400/401/403/429/5xx/timeout and remembering the first working entry for the session
 /// - Executes up to 3 rounds of tool calls via `ToolExecutor`
 nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
     public static let maxHistoryTurns: Int = 6
@@ -73,6 +108,7 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
     private let geminiClient: GeminiClient
     private let customClientOverride: LLMClient?
     private let historyStore: ConversationHistoryStore
+    private let sessionTracker = SessionChainTracker()
 
     public nonisolated init(
         config: LLMConfig = LLMConfig(),
@@ -94,6 +130,71 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         await historyStore.clear()
     }
 
+    #if DEBUG
+    /// Sends `"ping"` through each entry in `config.chain` at startup (DEBUG builds only) and logs status, ttfb, and total ms.
+    public nonisolated func runStartupSelfTestIfNeeded() {
+        guard customClientOverride == nil else { return }
+        guard sessionTracker.markSelfTestStartedIfNeeded() else { return }
+
+        let chain = config.chain.isEmpty ? LLMConfig.defaultChain : config.chain
+        let groqClient = self.groqClient
+        let geminiClient = self.geminiClient
+
+        Task.detached(priority: .utility) {
+            var firstWorkingIdx: Int?
+            for (idx, entry) in chain.enumerated() {
+                let start = ContinuousClock.now
+                let ttfbTracker = FirstTokenTracker(startClock: start, callback: nil)
+                do {
+                    let result: LLMStreamResult
+                    switch entry.provider {
+                    case .groq:
+                        result = try await groqClient.streamChat(
+                            messages: [.user("ping")],
+                            systemPrompt: "Reply with a single word: pong.",
+                            tools: [],
+                            modelOverride: entry.model,
+                            onFirstToken: {
+                                ttfbTracker.recordIfNeeded()
+                            },
+                            onTextDelta: { _ in
+                                ttfbTracker.recordIfNeeded()
+                            }
+                        )
+                    case .gemini:
+                        result = try await geminiClient.streamChat(
+                            messages: [.user("ping")],
+                            systemPrompt: "Reply with a single word: pong.",
+                            tools: [],
+                            modelOverride: entry.model,
+                            onFirstToken: {
+                                ttfbTracker.recordIfNeeded()
+                            },
+                            onTextDelta: { _ in
+                                ttfbTracker.recordIfNeeded()
+                            }
+                        )
+                    }
+                    let totalMs = Self.milliseconds(since: start)
+                    let ttfbMs = ttfbTracker.firstTokenMs ?? totalMs
+                    if firstWorkingIdx == nil {
+                        firstWorkingIdx = idx
+                    }
+                    let cleanReply = LLMError.sanitizeErrorSnippet(result.text, maxChars: 60)
+                    print("[LLM SELF-TEST] provider=\(entry.provider.rawValue.lowercased()) model=\(entry.model) status=OK ttfb=\(Int(ttfbMs.rounded()))ms total=\(Int(totalMs.rounded()))ms reply=\"\(cleanReply)\"")
+                } catch {
+                    let totalMs = Self.milliseconds(since: start)
+                    let errDesc = LLMError.sanitizeErrorSnippet(error.localizedDescription, maxChars: 240)
+                    print("[LLM SELF-TEST] provider=\(entry.provider.rawValue.lowercased()) model=\(entry.model) status=FAIL(\(errDesc)) ttfb=- total=\(Int(totalMs.rounded()))ms")
+                }
+            }
+            if let firstWorkingIdx {
+                self.sessionTracker.recordFirstWorkingIndex(firstWorkingIdx)
+            }
+        }
+    }
+    #endif
+
     // MARK: - LLMClient Conformance
 
     public nonisolated func generateResponse(prompt: String, language: VoiceAgentViewModel.Language) async throws -> String {
@@ -114,10 +215,12 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         onFirstToken: (@Sendable () -> Void)? = nil,
         onTextDelta: (@Sendable (String) -> Void)? = nil
     ) async throws -> LLMStreamResult {
-        try await streamWithProviderFallback(
+        var fallbackErrors: [String] = []
+        return try await streamWithProviderFallback(
             messages: messages,
             systemPrompt: systemPrompt,
             tools: tools,
+            encounteredErrors: &fallbackErrors,
             onFirstToken: onFirstToken,
             onTextDelta: onTextDelta
         )
@@ -126,13 +229,6 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
     // MARK: - Full Agent Loop (History + Tool Calling + Streaming + Fallback)
 
     /// Runs a full user turn through the LLM with up to 3 tool-execution rounds and live delta streaming.
-    /// - Parameters:
-    ///   - userText: Transcribed or typed user message.
-    ///   - language: Selected UI language mode (`English` or `Hinglish`).
-    ///   - onFirstToken: Called when the first LLM token arrives (records `llmFirstTokenMs`).
-    ///   - onTextDelta: Called with each streamed text delta so the UI response card updates live.
-    ///   - onSentenceReady: Phase 6 hook called whenever a complete spoken sentence is ready during streaming.
-    /// - Returns: `AgentTurnResult` containing the final reply, latency metrics, answering provider, and executed tool calls.
     public nonisolated func runTurn(
         userText: String,
         language: VoiceAgentViewModel.Language,
@@ -162,54 +258,66 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         let sentenceBuffer = SentenceStreamBuffer(callback: onSentenceReady)
 
         var executedTools: [LLMToolCall] = []
+        var encounteredErrors: [String] = []
         var finalReply = ""
         var answeringProvider = ""
         var answeringModel = ""
 
-        for round in 0...Self.maxToolRounds {
-            try Task.checkCancellation()
-            // On the final round after maxToolRounds tool executions, omit tools so the model must synthesize a spoken answer
-            let activeTools = (round < Self.maxToolRounds) ? tools : []
-
-            let streamResult = try await streamWithProviderFallback(
-                messages: messages,
-                systemPrompt: systemPrompt,
-                tools: activeTools,
-                onFirstToken: {
-                    firstTokenState.recordIfNeeded()
-                },
-                onTextDelta: { delta in
-                    firstTokenState.recordIfNeeded()
-                    onTextDelta?(delta)
-                    sentenceBuffer.append(delta)
-                }
-            )
-
-            answeringProvider = streamResult.providerName
-            answeringModel = streamResult.modelName
-
-            if streamResult.toolCalls.isEmpty || round == Self.maxToolRounds {
-                finalReply = Self.sanitizeSpokenReply(streamResult.text)
-                break
-            }
-
-            // Record assistant tool-call message
-            messages.append(.assistant(streamResult.text, toolCalls: streamResult.toolCalls))
-
-            // Execute each requested tool call and append tool results
-            for call in streamResult.toolCalls {
+        do {
+            for round in 0...Self.maxToolRounds {
                 try Task.checkCancellation()
-                executedTools.append(call)
-                let toolOutputJSON: String
-                do {
-                    toolOutputJSON = try await toolExecutor.execute(call: call)
-                    print("[AgentOrchestrator] Executed tool '\(call.name)' args=\(call.argumentsJSON) -> \(toolOutputJSON)")
-                } catch {
-                    print("[AgentOrchestrator] Tool '\(call.name)' failed: \(error)")
-                    toolOutputJSON = #"{"status":"error","message":"Tool execution failed"}"#
+                // On the final round after maxToolRounds tool executions, omit tools so the model must synthesize a spoken answer
+                let activeTools = (round < Self.maxToolRounds) ? tools : []
+
+                let streamResult = try await streamWithProviderFallback(
+                    messages: messages,
+                    systemPrompt: systemPrompt,
+                    tools: activeTools,
+                    encounteredErrors: &encounteredErrors,
+                    onFirstToken: {
+                        firstTokenState.recordIfNeeded()
+                    },
+                    onTextDelta: { delta in
+                        firstTokenState.recordIfNeeded()
+                        onTextDelta?(delta)
+                        sentenceBuffer.append(delta)
+                    }
+                )
+
+                answeringProvider = streamResult.providerName
+                answeringModel = streamResult.modelName
+
+                if streamResult.toolCalls.isEmpty || round == Self.maxToolRounds {
+                    finalReply = Self.sanitizeSpokenReply(streamResult.text)
+                    break
                 }
-                messages.append(.toolResult(id: call.id, name: call.name, content: toolOutputJSON))
+
+                // Record assistant tool-call message
+                messages.append(.assistant(streamResult.text, toolCalls: streamResult.toolCalls))
+
+                // Execute each requested tool call and append tool results
+                for call in streamResult.toolCalls {
+                    try Task.checkCancellation()
+                    executedTools.append(call)
+                    let toolOutputJSON: String
+                    do {
+                        toolOutputJSON = try await toolExecutor.execute(call: call)
+                        print("[AgentOrchestrator] Executed tool '\(call.name)' args=\(call.argumentsJSON) -> \(toolOutputJSON)")
+                    } catch {
+                        print("[AgentOrchestrator] Tool '\(call.name)' failed: \(error)")
+                        toolOutputJSON = #"{"status":"error","message":"Tool execution failed"}"#
+                    }
+                    messages.append(.toolResult(id: call.id, name: call.name, content: toolOutputJSON))
+                }
             }
+        } catch {
+            let totalElapsedMs = Self.milliseconds(since: startClock)
+            let toolNames = executedTools.isEmpty ? "none" : executedTools.map(\.name).joined(separator: ",")
+            let errorSummary = encounteredErrors.isEmpty
+                ? LLMError.sanitizeErrorSnippet(error.localizedDescription, maxChars: 400)
+                : encounteredErrors.joined(separator: " | ")
+            print("[LLM DEBUG] provider=none model=none ttfb=- total=\(Int(totalElapsedMs.rounded())) tools=\(toolNames) errors=\(errorSummary)")
+            throw error
         }
 
         sentenceBuffer.flushRemaining()
@@ -217,7 +325,11 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         let totalElapsedMs = Self.milliseconds(since: startClock)
         let firstTokenMs = firstTokenState.firstTokenMs ?? totalElapsedMs
         let toolNames = executedTools.isEmpty ? "none" : executedTools.map(\.name).joined(separator: ",")
-        print("[LLM DEBUG] provider=\(answeringProvider.lowercased()) ttfb=\(Int(firstTokenMs.rounded())) total=\(Int(totalElapsedMs.rounded())) tools=\(toolNames)")
+        if encounteredErrors.isEmpty {
+            print("[LLM DEBUG] provider=\(answeringProvider.lowercased()) model=\(answeringModel) ttfb=\(Int(firstTokenMs.rounded())) total=\(Int(totalElapsedMs.rounded())) tools=\(toolNames)")
+        } else {
+            print("[LLM DEBUG] provider=\(answeringProvider.lowercased()) model=\(answeringModel) ttfb=\(Int(firstTokenMs.rounded())) total=\(Int(totalElapsedMs.rounded())) tools=\(toolNames) fallback_errors=\(encounteredErrors.joined(separator: " | "))")
+        }
 
         if !finalReply.isEmpty {
             await historyStore.appendTurn(user: trimmedInput, assistant: finalReply)
@@ -233,12 +345,13 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         )
     }
 
-    // MARK: - Provider Fallback Logic
+    // MARK: - Ordered Cross-Provider Fallback Chain
 
     private nonisolated func streamWithProviderFallback(
         messages: [LLMChatMessage],
         systemPrompt: String,
         tools: [LLMToolDefinition],
+        encounteredErrors: inout [String],
         onFirstToken: (@Sendable () -> Void)?,
         onTextDelta: (@Sendable (String) -> Void)?
     ) async throws -> LLMStreamResult {
@@ -254,61 +367,119 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
             return result
         }
 
-        let groqKeyPresent = !Secrets.groqKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let geminiKeyPresent = !Secrets.geminiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if !groqKeyPresent && !geminiKeyPresent {
-            throw LLMError.missingAllAPIKeys
+        let chain = config.chain.isEmpty ? LLMConfig.defaultChain : config.chain
+        let startIdx = sessionTracker.preferredStartIndex(chainCount: chain.count)
+
+        // Order indices starting from the session's remembered working entry, then wrapping to any remaining entries if needed
+        var orderedIndices: [Int] = Array(startIdx..<chain.count)
+        if startIdx > 0 {
+            orderedIndices.append(contentsOf: 0..<startIdx)
         }
 
-        var lastError: Error?
-        let providers = config.providerOrder.isEmpty ? LLMConfig.defaultProviderOrder : config.providerOrder
+        var groqErrors: [String] = []
+        var geminiErrors: [String] = []
+        var allEntryErrors: [String] = []
 
-        for (index, provider) in providers.enumerated() {
+        for (attemptOffset, chainIdx) in orderedIndices.enumerated() {
             try Task.checkCancellation()
-            let client: LLMClient = (provider == .groq) ? groqClient : geminiClient
-            let modelName = config.modelName(for: provider)
+            let entry = chain[chainIdx]
+
+            // If we already recorded a missing/invalid key for this provider on an earlier model in this turn, skip straight to the next provider
+            if entry.provider == .groq,
+               groqErrors.contains(where: { $0.contains("Groq key missing") || $0.contains("Groq key invalid") }) {
+                continue
+            }
+            if entry.provider == .gemini,
+               geminiErrors.contains(where: { $0.contains("Gemini key missing") || $0.contains("Gemini key invalid") }) {
+                continue
+            }
 
             do {
-                let result = try await client.streamChat(
-                    messages: messages,
-                    systemPrompt: systemPrompt,
-                    tools: tools,
-                    onFirstToken: onFirstToken,
-                    onTextDelta: onTextDelta
-                )
+                let result: LLMStreamResult
+                switch entry.provider {
+                case .groq:
+                    result = try await groqClient.streamChat(
+                        messages: messages,
+                        systemPrompt: systemPrompt,
+                        tools: tools,
+                        modelOverride: entry.model,
+                        onFirstToken: onFirstToken,
+                        onTextDelta: onTextDelta
+                    )
+                case .gemini:
+                    result = try await geminiClient.streamChat(
+                        messages: messages,
+                        systemPrompt: systemPrompt,
+                        tools: tools,
+                        modelOverride: entry.model,
+                        onFirstToken: onFirstToken,
+                        onTextDelta: onTextDelta
+                    )
+                }
+
+                sessionTracker.recordFirstWorkingIndex(chainIdx)
                 print("[LLM] Answered by \(result.providerName) (\(result.modelName))")
                 return result
             } catch is CancellationError {
                 throw CancellationError()
             } catch let llmError as LLMError {
-                lastError = llmError
-                let hasNextProvider = (index + 1) < providers.count
-                if hasNextProvider && llmError.shouldFallbackToNextProvider {
-                    let nextProvider = providers[index + 1]
-                    print("[LLM] \(provider.rawValue) (\(modelName)) failed (\(llmError.localizedDescription)); falling back to \(nextProvider.rawValue) (\(config.modelName(for: nextProvider)))")
+                let formatted = llmError.localizedDescription
+                allEntryErrors.append(formatted)
+                encounteredErrors.append(formatted)
+                switch entry.provider {
+                case .groq:
+                    groqErrors.append(formatted)
+                case .gemini:
+                    geminiErrors.append(formatted)
+                }
+
+                let hasNextEntry = (attemptOffset + 1) < orderedIndices.count
+                if hasNextEntry && llmError.shouldFallbackToNextProvider {
+                    let nextEntry = chain[orderedIndices[attemptOffset + 1]]
+                    print("[LLM] \(entry.provider.rawValue) (\(entry.model)) failed (\(formatted)); advancing fallback chain to \(nextEntry.provider.rawValue) (\(nextEntry.model))")
                     continue
                 }
-                throw llmError
+                break
             } catch {
-                lastError = error
-                let hasNextProvider = (index + 1) < providers.count
-                if hasNextProvider {
-                    let nextProvider = providers[index + 1]
-                    print("[LLM] \(provider.rawValue) (\(modelName)) failed (\(error.localizedDescription)); falling back to \(nextProvider.rawValue) (\(config.modelName(for: nextProvider)))")
+                let formatted = "\(entry.provider.rawValue) (\(entry.model)): \(LLMError.sanitizeErrorSnippet(error.localizedDescription, maxChars: 200))"
+                allEntryErrors.append(formatted)
+                encounteredErrors.append(formatted)
+                switch entry.provider {
+                case .groq:
+                    groqErrors.append(formatted)
+                case .gemini:
+                    geminiErrors.append(formatted)
+                }
+
+                let hasNextEntry = (attemptOffset + 1) < orderedIndices.count
+                if hasNextEntry {
+                    let nextEntry = chain[orderedIndices[attemptOffset + 1]]
+                    print("[LLM] \(entry.provider.rawValue) (\(entry.model)) failed (\(formatted)); advancing fallback chain to \(nextEntry.provider.rawValue) (\(nextEntry.model))")
                     continue
                 }
-                throw error
+                break
             }
         }
 
-        throw lastError ?? LLMError.missingAllAPIKeys
+        let groqSummary = groqErrors.isEmpty ? nil : groqErrors.joined(separator: "; ")
+        let geminiSummary = geminiErrors.isEmpty ? nil : geminiErrors.joined(separator: "; ")
+        throw LLMError.chainFailed(
+            groqError: groqSummary,
+            geminiError: geminiSummary,
+            details: allEntryErrors
+        )
     }
 
     // MARK: - Helpers
 
-    /// Strips any residual markdown formatting (`*`, `#`, `` ` ``) so TTS speaks clean text.
+    /// Strips any residual markdown formatting (`*`, `#`, `` ` ``) and `<think>` blocks so TTS speaks clean text.
     nonisolated static func sanitizeSpokenReply(_ raw: String) -> String {
-        var cleaned = raw
+        var cleaned = raw.replacingOccurrences(
+            of: #"(?is)<think>.*?</think>"#,
+            with: "",
+            options: .regularExpression
+        )
+        cleaned = cleaned
             .replacingOccurrences(of: "**", with: "")
             .replacingOccurrences(of: "__", with: "")
             .replacingOccurrences(of: "`", with: "")

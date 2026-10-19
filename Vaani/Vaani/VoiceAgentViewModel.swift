@@ -166,7 +166,7 @@ public final class VoiceAgentViewModel {
     /// Optional error description for user-facing alerts or banners.
     public var errorMessage: String?
 
-    /// Name of the LLM provider + model that answered the most recent turn (e.g. `"Groq • llama-3.3-70b-versatile"`).
+    /// Name of the LLM provider + model that answered the most recent turn (e.g. `"Groq • openai/gpt-oss-120b"`).
     public var lastAnsweringProvider: String?
 
     /// Phase 6 hook: invoked on `@MainActor` as each complete sentence is streamed from the LLM.
@@ -268,10 +268,15 @@ public final class VoiceAgentViewModel {
         }
     }
 
-    /// Starts STT and Kokoro TTS model setup asynchronously once the app UI has appeared.
+    /// Starts STT, Kokoro TTS, and DEBUG LLM startup self-test asynchronously once the app UI has appeared.
     public func prepareSpeechToText() {
         validateAPIKeysForBanner()
         prepareTextToSpeech()
+        #if DEBUG
+        if llmClient is AgentOrchestrator {
+            orchestrator.runStartupSelfTestIfNeeded()
+        }
+        #endif
 
         guard let whisperSTT = sttClient as? WhisperKitSTT, !isSTTReady else { return }
 

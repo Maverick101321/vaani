@@ -10,15 +10,43 @@ nonisolated public enum LLMProvider: String, CaseIterable, Sendable, Identifiabl
     public var id: String { rawValue }
 }
 
-/// Centralized configuration for LLM providers, model names, generation parameters, and fallback timeouts.
+/// Single entry in the ordered cross-provider LLM fallback chain.
+nonisolated public struct LLMChainEntry: Sendable, Equatable, Identifiable {
+    public let provider: LLMProvider
+    public let model: String
+
+    public var id: String { "\(provider.rawValue):\(model)" }
+
+    public init(provider: LLMProvider, model: String) {
+        self.provider = provider
+        self.model = model
+    }
+}
+
+/// Centralized configuration for LLM providers, ordered model fallback chain, generation parameters, and timeouts.
 nonisolated public struct LLMConfig: Sendable, Equatable {
-    /// Editable default Groq model name.
-    public static let defaultGroqModel: String = "llama-3.3-70b-versatile"
-    /// Editable default Gemini model name.
-    public static let defaultGeminiModel: String = "gemini-2.5-flash"
+    /// Editable primary Groq model name.
+    public static let defaultGroqModel: String = "openai/gpt-oss-120b"
+    /// Editable secondary Groq fallback model name.
+    public static let defaultGroqFallbackModel: String = "openai/gpt-oss-20b"
+    /// Editable primary Gemini model name.
+    public static let defaultGeminiModel: String = "gemini-3.5-flash-lite"
+    /// Editable secondary Gemini fallback model name.
+    public static let defaultGeminiFallbackModel: String = "gemini-3.1-flash-lite"
+
+    /// Default ordered fallback chain across providers:
+    /// Groq `openai/gpt-oss-120b` -> Groq `openai/gpt-oss-20b` -> Gemini `gemini-3.5-flash-lite` -> Gemini `gemini-3.1-flash-lite`.
+    public static let defaultChain: [LLMChainEntry] = [
+        LLMChainEntry(provider: .groq, model: defaultGroqModel),
+        LLMChainEntry(provider: .groq, model: defaultGroqFallbackModel),
+        LLMChainEntry(provider: .gemini, model: defaultGeminiModel),
+        LLMChainEntry(provider: .gemini, model: defaultGeminiFallbackModel)
+    ]
+
     /// Default provider fallback order: Groq first, then Gemini.
     public static let defaultProviderOrder: [LLMProvider] = [.groq, .gemini]
 
+    public var chain: [LLMChainEntry]
     public var providerOrder: [LLMProvider]
     public var groqModel: String
     public var geminiModel: String
@@ -27,13 +55,15 @@ nonisolated public struct LLMConfig: Sendable, Equatable {
     public var timeoutSeconds: TimeInterval
 
     public init(
+        chain: [LLMChainEntry] = LLMConfig.defaultChain,
         providerOrder: [LLMProvider] = LLMConfig.defaultProviderOrder,
         groqModel: String = LLMConfig.defaultGroqModel,
         geminiModel: String = LLMConfig.defaultGeminiModel,
         temperature: Double = 0.3,
-        maxTokens: Int = 150,
+        maxTokens: Int = 512,
         timeoutSeconds: TimeInterval = 8.0
     ) {
+        self.chain = chain
         self.providerOrder = providerOrder
         self.groqModel = groqModel
         self.geminiModel = geminiModel
@@ -54,36 +84,92 @@ nonisolated public struct LLMConfig: Sendable, Equatable {
 
 // MARK: - LLM Errors
 
-/// Structured errors for LLM requests and provider fallback decisions.
+/// Structured errors for LLM requests and cross-provider fallback decisions.
 nonisolated public enum LLMError: LocalizedError, Sendable, Equatable {
     case missingAPIKey(provider: LLMProvider)
     case missingAllAPIKeys
-    case timeout(provider: LLMProvider, seconds: TimeInterval)
-    case httpError(provider: LLMProvider, statusCode: Int, message: String)
-    case invalidResponse(provider: LLMProvider, details: String)
+    case timeout(provider: LLMProvider, model: String = "", seconds: TimeInterval)
+    case httpError(provider: LLMProvider, model: String = "", statusCode: Int, message: String)
+    case invalidResponse(provider: LLMProvider, model: String = "", details: String)
+    case chainFailed(groqError: String?, geminiError: String?, details: [String])
+
+    /// Redacts any accidental API key appearance and collapses whitespace to at most `maxChars` characters.
+    public static func sanitizeErrorSnippet(_ raw: String, maxChars: Int = 200) -> String {
+        var cleaned = raw
+        let groqKey = Secrets.groqKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !groqKey.isEmpty {
+            cleaned = cleaned.replacingOccurrences(of: groqKey, with: "[REDACTED]")
+        }
+        let geminiKey = Secrets.geminiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !geminiKey.isEmpty {
+            cleaned = cleaned.replacingOccurrences(of: geminiKey, with: "[REDACTED]")
+        }
+        cleaned = cleaned.replacingOccurrences(
+            of: #"\s+"#,
+            with: " ",
+            options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.count > maxChars {
+            return String(cleaned.prefix(maxChars))
+        }
+        return cleaned
+    }
+
+    public var provider: LLMProvider? {
+        switch self {
+        case .missingAPIKey(let provider),
+             .timeout(let provider, _, _),
+             .httpError(let provider, _, _, _),
+             .invalidResponse(let provider, _, _):
+            return provider
+        case .missingAllAPIKeys, .chainFailed:
+            return nil
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
         case .missingAPIKey(let provider):
-            let keyName = (provider == .groq) ? "Secrets.groqKey" : "Secrets.geminiKey"
-            return "\(provider.rawValue) API key is empty. Please set `\(keyName)` in Vaani/Secrets.swift."
+            return "\(provider.rawValue) key missing"
         case .missingAllAPIKeys:
-            return "API keys are missing in Vaani/Secrets.swift. Please add your `Secrets.groqKey` and/or `Secrets.geminiKey` (see Secrets.example.swift)."
-        case .timeout(let provider, let seconds):
-            return "\(provider.rawValue) request timed out after \(Int(seconds))s."
-        case .httpError(let provider, let statusCode, let message):
-            let cleanMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
-            if cleanMessage.isEmpty {
-                return "\(provider.rawValue) HTTP \(statusCode) error."
+            return "Groq key missing | Gemini key missing"
+        case .timeout(let provider, let model, let seconds):
+            let modelTag = model.isEmpty ? "" : " (\(model))"
+            return "\(provider.rawValue)\(modelTag) HTTP timeout (\(Int(seconds))s)"
+        case .httpError(let provider, let model, let statusCode, let message):
+            let snippet = Self.sanitizeErrorSnippet(message, maxChars: 200)
+            let modelTag = model.isEmpty ? "" : " (\(model))"
+            if statusCode == 401 {
+                if snippet.isEmpty {
+                    return "\(provider.rawValue) key invalid (HTTP 401)"
+                }
+                return "\(provider.rawValue) key invalid (HTTP 401: \(snippet))"
             }
-            return "\(provider.rawValue) HTTP \(statusCode): \(cleanMessage)"
-        case .invalidResponse(let provider, let details):
-            return "\(provider.rawValue) invalid response: \(details)"
+            if snippet.isEmpty {
+                return "\(provider.rawValue)\(modelTag) HTTP \(statusCode)"
+            }
+            return "\(provider.rawValue)\(modelTag) HTTP \(statusCode): \(snippet)"
+        case .invalidResponse(let provider, let model, let details):
+            let snippet = Self.sanitizeErrorSnippet(details, maxChars: 200)
+            let modelTag = model.isEmpty ? "" : " (\(model))"
+            return "\(provider.rawValue)\(modelTag) invalid response: \(snippet)"
+        case .chainFailed(let groqError, let geminiError, let details):
+            var parts: [String] = []
+            if let groqError, !groqError.isEmpty {
+                parts.append(groqError)
+            }
+            if let geminiError, !geminiError.isEmpty {
+                parts.append(geminiError)
+            }
+            if !parts.isEmpty {
+                return parts.joined(separator: " | ")
+            }
+            return details.joined(separator: " | ")
         }
     }
 
-    /// Determines whether `AgentOrchestrator` should automatically fall back to the next provider in `LLMConfig.providerOrder`.
-    /// Falls back on: 404 / model-not-found, 429 (rate limit), 5xx (server error), 8s timeout, or missing single provider key.
+    /// Determines whether `AgentOrchestrator` should advance to the next entry in the fallback chain.
+    /// Advances on: 404, 400, 401, 403, 429, 5xx, timeout, missing key, or invalid response.
     public var shouldFallbackToNextProvider: Bool {
         switch self {
         case .missingAPIKey:
@@ -92,23 +178,20 @@ nonisolated public enum LLMError: LocalizedError, Sendable, Equatable {
             return false
         case .timeout:
             return true
-        case .httpError(_, let statusCode, let message):
-            if statusCode == 404 || statusCode == 429 || (500...599).contains(statusCode) {
+        case .httpError(_, _, let statusCode, _):
+            if statusCode == 400
+                || statusCode == 401
+                || statusCode == 403
+                || statusCode == 404
+                || statusCode == 429
+                || (500...599).contains(statusCode) {
                 return true
             }
-            let lower = message.lowercased()
-            if lower.contains("model_not_found")
-                || lower.contains("model not found")
-                || lower.contains("does not exist")
-                || lower.contains("not found")
-                || lower.contains("rate limit")
-                || lower.contains("quota")
-                || lower.contains("overloaded") {
-                return true
-            }
-            return false
+            return true
         case .invalidResponse:
             return true
+        case .chainFailed:
+            return false
         }
     }
 }
@@ -118,6 +201,7 @@ nonisolated public enum LLMError: LocalizedError, Sendable, Equatable {
 /// Runs an async operation with a strict timeout in seconds, throwing `LLMError.timeout` if exceeded.
 nonisolated func withLLMTimeout<T: Sendable>(
     provider: LLMProvider,
+    model: String = "",
     seconds: TimeInterval,
     operation: @escaping @Sendable () async throws -> T
 ) async throws -> T {
@@ -127,10 +211,10 @@ nonisolated func withLLMTimeout<T: Sendable>(
         }
         group.addTask {
             try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            throw LLMError.timeout(provider: provider, seconds: seconds)
+            throw LLMError.timeout(provider: provider, model: model, seconds: seconds)
         }
         guard let first = try await group.next() else {
-            throw LLMError.timeout(provider: provider, seconds: seconds)
+            throw LLMError.timeout(provider: provider, model: model, seconds: seconds)
         }
         group.cancelAll()
         return first
@@ -166,6 +250,7 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
             messages: [.user(prompt)],
             systemPrompt: systemPrompt,
             tools: [],
+            modelOverride: nil,
             onFirstToken: nil,
             onTextDelta: nil
         )
@@ -179,12 +264,30 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
         onFirstToken: (@Sendable () -> Void)? = nil,
         onTextDelta: (@Sendable (String) -> Void)? = nil
     ) async throws -> LLMStreamResult {
+        try await streamChat(
+            messages: messages,
+            systemPrompt: systemPrompt,
+            tools: tools,
+            modelOverride: nil,
+            onFirstToken: onFirstToken,
+            onTextDelta: onTextDelta
+        )
+    }
+
+    public nonisolated func streamChat(
+        messages: [LLMChatMessage],
+        systemPrompt: String,
+        tools: [LLMToolDefinition],
+        modelOverride: String?,
+        onFirstToken: (@Sendable () -> Void)? = nil,
+        onTextDelta: (@Sendable (String) -> Void)? = nil
+    ) async throws -> LLMStreamResult {
         let rawKey = apiKeyProvider().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawKey.isEmpty else {
             throw LLMError.missingAPIKey(provider: .groq)
         }
 
-        let modelName = config.groqModel
+        let modelName = modelOverride ?? config.groqModel
         let timeoutSec = config.timeoutSeconds
         let request = try buildURLRequest(
             apiKey: rawKey,
@@ -194,16 +297,16 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
             tools: tools
         )
 
-        return try await withLLMTimeout(provider: .groq, seconds: timeoutSec) { [session] in
+        return try await withLLMTimeout(provider: .groq, model: modelName, seconds: timeoutSec) { [session] in
             let (bytes, response): (URLSession.AsyncBytes, URLResponse)
             do {
                 (bytes, response) = try await session.bytes(for: request)
             } catch let urlError as URLError where urlError.code == .timedOut {
-                throw LLMError.timeout(provider: .groq, seconds: timeoutSec)
+                throw LLMError.timeout(provider: .groq, model: modelName, seconds: timeoutSec)
             }
 
             guard let httpResponse = response as? HTTPURLResponse else {
-                throw LLMError.invalidResponse(provider: .groq, details: "Non-HTTP response")
+                throw LLMError.invalidResponse(provider: .groq, model: modelName, details: "Non-HTTP response")
             }
 
             if !(200...299).contains(httpResponse.statusCode) {
@@ -213,7 +316,7 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
                     if errorBody.count > 4096 { break }
                 }
 
-                // Handle Groq Llama 3.3 occasional `<function=name>{...}</function>` tool_use_failed 400 error
+                // Handle Groq `<function=name>{...}</function>` tool_use_failed 400 error if it occurs
                 if httpResponse.statusCode == 400,
                    let recoveredCall = Self.recoverGroqFailedToolGeneration(from: errorBody) {
                     onFirstToken?()
@@ -225,16 +328,18 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
                     )
                 }
 
-                let parsedMsg = Self.extractErrorMessage(from: errorBody)
+                let errorSnippet = Self.errorBodySnippet(errorBody)
                 throw LLMError.httpError(
                     provider: .groq,
+                    model: modelName,
                     statusCode: httpResponse.statusCode,
-                    message: parsedMsg
+                    message: errorSnippet
                 )
             }
 
             var accumulatedText = ""
             var didEmitFirstToken = false
+            var insideThinkTag = false
 
             struct PartialToolCall {
                 var id: String = ""
@@ -259,7 +364,8 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
 
                 if let errorObj = json["error"] as? [String: Any],
                    let errorMessage = errorObj["message"] as? String {
-                    throw LLMError.httpError(provider: .groq, statusCode: 500, message: errorMessage)
+                    let status = (errorObj["code"] as? Int) ?? 500
+                    throw LLMError.httpError(provider: .groq, model: modelName, statusCode: status, message: errorMessage)
                 }
 
                 guard let choices = json["choices"] as? [[String: Any]],
@@ -268,13 +374,17 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
                     continue
                 }
 
+                // NOTE: `delta["reasoning"]` is intentionally ignored so reasoning tokens never reach UI or TTS.
                 if let contentDelta = delta["content"] as? String, !contentDelta.isEmpty {
-                    if !didEmitFirstToken {
-                        didEmitFirstToken = true
-                        onFirstToken?()
+                    let filteredDelta = Self.stripThinkTags(from: contentDelta, insideThinkTag: &insideThinkTag)
+                    if !filteredDelta.isEmpty {
+                        if !didEmitFirstToken {
+                            didEmitFirstToken = true
+                            onFirstToken?()
+                        }
+                        accumulatedText += filteredDelta
+                        onTextDelta?(filteredDelta)
                     }
-                    accumulatedText += contentDelta
-                    onTextDelta?(contentDelta)
                 }
 
                 if let rawToolCalls = delta["tool_calls"] as? [[String: Any]] {
@@ -310,8 +420,11 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
                 return LLMToolCall(id: callID, name: partial.name, argumentsJSON: argsJSON)
             }
 
+            let cleanedText = Self.stripCompletedThinkBlocks(from: accumulatedText)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
             return LLMStreamResult(
-                text: accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines),
+                text: cleanedText,
                 toolCalls: finalizedToolCalls,
                 providerName: LLMProvider.groq.rawValue,
                 modelName: modelName
@@ -380,9 +493,15 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
             "model": modelName,
             "messages": openAIMessages,
             "temperature": config.temperature,
-            "max_tokens": config.maxTokens,
+            "max_completion_tokens": config.maxTokens,
             "stream": true
         ]
+
+        // Groq gpt-oss models are reasoning models: set reasoning_effort to "low" and exclude reasoning from output
+        if modelName.lowercased().contains("gpt-oss") {
+            body["reasoning_effort"] = "low"
+            body["include_reasoning"] = false
+        }
 
         if !tools.isEmpty {
             body["tools"] = tools.map { $0.toOpenAIToolDictionary() }
@@ -399,17 +518,46 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
         return request
     }
 
-    private nonisolated static func extractErrorMessage(from rawBody: String) -> String {
-        if let data = rawBody.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let errorObj = json["error"] as? [String: Any],
-           let message = errorObj["message"] as? String {
-            return message
+    /// Strips any `<think>...</think>` blocks if a reasoning model emits inline think tags.
+    private nonisolated static func stripThinkTags(from chunk: String, insideThinkTag: inout Bool) -> String {
+        var remaining = chunk
+        var output = ""
+        while !remaining.isEmpty {
+            if insideThinkTag {
+                if let endRange = remaining.range(of: "</think>", options: .caseInsensitive) {
+                    insideThinkTag = false
+                    remaining = String(remaining[endRange.upperBound...])
+                } else {
+                    return output
+                }
+            } else {
+                if let startRange = remaining.range(of: "<think>", options: .caseInsensitive) {
+                    output += String(remaining[..<startRange.lowerBound])
+                    insideThinkTag = true
+                    remaining = String(remaining[startRange.upperBound...])
+                } else {
+                    output += remaining
+                    break
+                }
+            }
         }
-        return String(rawBody.prefix(240))
+        return output
     }
 
-    /// Parses Groq's `failed_generation` XML-style function call if Llama-3.3 outputs `<function=name>{"arg":...}</function>`.
+    private nonisolated static func stripCompletedThinkBlocks(from text: String) -> String {
+        text.replacingOccurrences(
+            of: #"(?is)<think>.*?</think>"#,
+            with: "",
+            options: .regularExpression
+        )
+    }
+
+    /// Preserves the first 200 redacted characters of the provider's actual error body.
+    private nonisolated static func errorBodySnippet(_ rawBody: String) -> String {
+        LLMError.sanitizeErrorSnippet(rawBody, maxChars: 200)
+    }
+
+    /// Parses Groq's `failed_generation` XML-style function call if a model outputs `<function=name>{"arg":...}</function>`.
     private nonisolated static func recoverGroqFailedToolGeneration(from rawBody: String) -> LLMToolCall? {
         guard let data = rawBody.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -463,6 +611,7 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
             messages: [.user(prompt)],
             systemPrompt: systemPrompt,
             tools: [],
+            modelOverride: nil,
             onFirstToken: nil,
             onTextDelta: nil
         )
@@ -476,31 +625,91 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
         onFirstToken: (@Sendable () -> Void)? = nil,
         onTextDelta: (@Sendable (String) -> Void)? = nil
     ) async throws -> LLMStreamResult {
+        try await streamChat(
+            messages: messages,
+            systemPrompt: systemPrompt,
+            tools: tools,
+            modelOverride: nil,
+            onFirstToken: onFirstToken,
+            onTextDelta: onTextDelta
+        )
+    }
+
+    public nonisolated func streamChat(
+        messages: [LLMChatMessage],
+        systemPrompt: String,
+        tools: [LLMToolDefinition],
+        modelOverride: String?,
+        onFirstToken: (@Sendable () -> Void)? = nil,
+        onTextDelta: (@Sendable (String) -> Void)? = nil
+    ) async throws -> LLMStreamResult {
         let rawKey = apiKeyProvider().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawKey.isEmpty else {
             throw LLMError.missingAPIKey(provider: .gemini)
         }
 
-        let modelName = config.geminiModel
+        let modelName = modelOverride ?? config.geminiModel
         let timeoutSec = config.timeoutSeconds
+
+        do {
+            return try await performStreamRequest(
+                apiKey: rawKey,
+                modelName: modelName,
+                messages: messages,
+                systemPrompt: systemPrompt,
+                tools: tools,
+                includeThinkingConfig: true,
+                timeoutSec: timeoutSec,
+                onFirstToken: onFirstToken,
+                onTextDelta: onTextDelta
+            )
+        } catch let LLMError.httpError(_, _, statusCode, _) where statusCode == 400 {
+            // If Gemini 3.x returns 400 for the thinkingConfig parameter, retry once without thinkingConfig
+            print("[GeminiClient] HTTP 400 with thinkingConfig on \(modelName); retrying once without thinkingConfig")
+            return try await performStreamRequest(
+                apiKey: rawKey,
+                modelName: modelName,
+                messages: messages,
+                systemPrompt: systemPrompt,
+                tools: tools,
+                includeThinkingConfig: false,
+                timeoutSec: timeoutSec,
+                onFirstToken: onFirstToken,
+                onTextDelta: onTextDelta
+            )
+        }
+    }
+
+    private nonisolated func performStreamRequest(
+        apiKey: String,
+        modelName: String,
+        messages: [LLMChatMessage],
+        systemPrompt: String,
+        tools: [LLMToolDefinition],
+        includeThinkingConfig: Bool,
+        timeoutSec: TimeInterval,
+        onFirstToken: (@Sendable () -> Void)?,
+        onTextDelta: (@Sendable (String) -> Void)?
+    ) async throws -> LLMStreamResult {
         let request = try buildURLRequest(
-            apiKey: rawKey,
+            apiKey: apiKey,
             modelName: modelName,
             messages: messages,
             systemPrompt: systemPrompt,
-            tools: tools
+            tools: tools,
+            includeThinkingConfig: includeThinkingConfig
         )
 
-        return try await withLLMTimeout(provider: .gemini, seconds: timeoutSec) { [session] in
+        return try await withLLMTimeout(provider: .gemini, model: modelName, seconds: timeoutSec) { [session] in
             let (bytes, response): (URLSession.AsyncBytes, URLResponse)
             do {
                 (bytes, response) = try await session.bytes(for: request)
             } catch let urlError as URLError where urlError.code == .timedOut {
-                throw LLMError.timeout(provider: .gemini, seconds: timeoutSec)
+                throw LLMError.timeout(provider: .gemini, model: modelName, seconds: timeoutSec)
             }
 
             guard let httpResponse = response as? HTTPURLResponse else {
-                throw LLMError.invalidResponse(provider: .gemini, details: "Non-HTTP response")
+                throw LLMError.invalidResponse(provider: .gemini, model: modelName, details: "Non-HTTP response")
             }
 
             if !(200...299).contains(httpResponse.statusCode) {
@@ -509,11 +718,12 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                     errorBody += line + "\n"
                     if errorBody.count > 4096 { break }
                 }
-                let parsedMsg = Self.extractErrorMessage(from: errorBody)
+                let errorSnippet = Self.errorBodySnippet(errorBody)
                 throw LLMError.httpError(
                     provider: .gemini,
+                    model: modelName,
                     statusCode: httpResponse.statusCode,
-                    message: parsedMsg
+                    message: errorSnippet
                 )
             }
 
@@ -538,7 +748,12 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                 if let errorObj = json["error"] as? [String: Any],
                    let errorMessage = errorObj["message"] as? String {
                     let code = (errorObj["code"] as? Int) ?? 500
-                    throw LLMError.httpError(provider: .gemini, statusCode: code, message: errorMessage)
+                    throw LLMError.httpError(
+                        provider: .gemini,
+                        model: modelName,
+                        statusCode: code,
+                        message: LLMError.sanitizeErrorSnippet(errorMessage, maxChars: 200)
+                    )
                 }
 
                 guard let candidates = json["candidates"] as? [[String: Any]],
@@ -549,7 +764,7 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                 }
 
                 for part in parts {
-                    // Skip internal thinking parts if any are emitted
+                    // Skip internal thinking parts so thoughts never reach UI or TTS
                     if (part["thought"] as? Bool) == true {
                         continue
                     }
@@ -575,9 +790,13 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                         let argsJSON = String(data: argsData, encoding: .utf8) ?? "{}"
                         let thoughtSig = part["thoughtSignature"] as? String
 
+                        let providerCallID = (fnCall["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let callID = (providerCallID?.isEmpty == false)
+                            ? providerCallID!
+                            : "gemini_call_\(collectedToolCalls.count)_\(UUID().uuidString.prefix(8))"
                         collectedToolCalls.append(
                             LLMToolCall(
-                                id: "gemini_call_\(collectedToolCalls.count)_\(UUID().uuidString.prefix(8))",
+                                id: callID,
                                 name: fnName,
                                 argumentsJSON: argsJSON,
                                 thoughtSignature: thoughtSig
@@ -601,11 +820,12 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
         modelName: String,
         messages: [LLMChatMessage],
         systemPrompt: String,
-        tools: [LLMToolDefinition]
+        tools: [LLMToolDefinition],
+        includeThinkingConfig: Bool
     ) throws -> URLRequest {
         let encodedModel = modelName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? modelName
         guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):streamGenerateContent?alt=sse") else {
-            throw LLMError.invalidResponse(provider: .gemini, details: "Invalid Gemini endpoint URL")
+            throw LLMError.invalidResponse(provider: .gemini, model: modelName, details: "Invalid Gemini endpoint URL")
         }
 
         var contents: [[String: Any]] = []
@@ -628,6 +848,7 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                 for tc in msg.toolCalls {
                     var fnCallPart: [String: Any] = [
                         "functionCall": [
+                            "id": tc.id,
                             "name": tc.name,
                             "args": tc.decodedArguments()
                         ]
@@ -654,6 +875,7 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
 
                 let fnResponsePart: [String: Any] = [
                     "functionResponse": [
+                        "id": msg.toolCallId ?? "",
                         "name": msg.toolName ?? "tool",
                         "response": responseObj
                     ]
@@ -680,10 +902,10 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
             "temperature": config.temperature,
             "maxOutputTokens": config.maxTokens
         ]
-        // Disable thinking budget on Gemini 2.5 Flash for ultra-low voice assistant TTFT and to preserve maxOutputTokens
-        if modelName.lowercased().contains("2.5") {
+        // Gemini 3.x models always reason: do not send thinkingBudget: 0. Flash-Lite's lowest level is MINIMAL.
+        if includeThinkingConfig {
             generationConfig["thinkingConfig"] = [
-                "thinkingBudget": 0
+                "thinkingLevel": "MINIMAL"
             ]
         }
 
@@ -716,13 +938,8 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
         return request
     }
 
-    private nonisolated static func extractErrorMessage(from rawBody: String) -> String {
-        if let data = rawBody.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let errorObj = json["error"] as? [String: Any],
-           let message = errorObj["message"] as? String {
-            return message
-        }
-        return String(rawBody.prefix(240))
+    /// Preserves the first 200 redacted characters of the provider's actual error body.
+    private nonisolated static func errorBodySnippet(_ rawBody: String) -> String {
+        LLMError.sanitizeErrorSnippet(rawBody, maxChars: 200)
     }
 }
