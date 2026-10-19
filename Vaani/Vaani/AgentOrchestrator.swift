@@ -8,6 +8,7 @@ nonisolated public struct AgentTurnResult: Sendable, Equatable {
     public let providerName: String
     public let modelName: String
     public let executedToolCalls: [LLMToolCall]
+    public let executedToolOutputs: [String]
 
     public init(
         reply: String,
@@ -15,7 +16,8 @@ nonisolated public struct AgentTurnResult: Sendable, Equatable {
         totalMs: Double,
         providerName: String,
         modelName: String,
-        executedToolCalls: [LLMToolCall] = []
+        executedToolCalls: [LLMToolCall] = [],
+        executedToolOutputs: [String] = []
     ) {
         self.reply = reply
         self.firstTokenMs = firstTokenMs
@@ -23,6 +25,7 @@ nonisolated public struct AgentTurnResult: Sendable, Equatable {
         self.providerName = providerName
         self.modelName = modelName
         self.executedToolCalls = executedToolCalls
+        self.executedToolOutputs = executedToolOutputs
     }
 }
 
@@ -31,12 +34,17 @@ private actor ConversationHistoryStore {
     /// Maximum number of user+assistant conversation turns to retain (`6` turns = up to 12 user/assistant messages).
     private let maxTurns: Int
     private var turns: [(user: String, assistant: String)] = []
+    private var lastLanguage: VoiceAgentViewModel.Language?
 
     init(maxTurns: Int = 6) {
         self.maxTurns = maxTurns
     }
 
-    func recentMessages() -> [LLMChatMessage] {
+    func recentMessages(for language: VoiceAgentViewModel.Language) -> [LLMChatMessage] {
+        if let lastLanguage, lastLanguage != language {
+            turns.removeAll()
+        }
+        lastLanguage = language
         var messages: [LLMChatMessage] = []
         messages.reserveCapacity(turns.count * 2)
         for turn in turns {
@@ -46,7 +54,11 @@ private actor ConversationHistoryStore {
         return messages
     }
 
-    func appendTurn(user: String, assistant: String) {
+    func appendTurn(user: String, assistant: String, language: VoiceAgentViewModel.Language) {
+        if let lastLanguage, lastLanguage != language {
+            turns.removeAll()
+        }
+        lastLanguage = language
         guard !user.isEmpty, !assistant.isEmpty else { return }
         turns.append((user: user, assistant: assistant))
         if turns.count > maxTurns {
@@ -56,6 +68,7 @@ private actor ConversationHistoryStore {
 
     func clear() {
         turns.removeAll()
+        lastLanguage = nil
     }
 }
 
@@ -112,7 +125,7 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
 
     public nonisolated init(
         config: LLMConfig = LLMConfig(),
-        toolExecutor: ToolExecutor = StubToolExecutor(),
+        toolExecutor: ToolExecutor = VaaniToolExecutor(),
         groqClient: GroqClient? = nil,
         geminiClient: GeminiClient? = nil,
         customClientOverride: LLMClient? = nil
@@ -127,6 +140,11 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
 
     /// Clears the in-memory 6-turn conversation history.
     public nonisolated func clearHistory() async {
+        await historyStore.clear()
+    }
+
+    /// Resets the conversation history (alias for `clearHistory()`).
+    public nonisolated func reset() async {
         await historyStore.clear()
     }
 
@@ -247,17 +265,21 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
             )
         }
 
+        let transcriptPreview = String(trimmedInput.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        print("[LANG] mode=\(language.rawValue) transcript=\(transcriptPreview)")
+
         let startClock = ContinuousClock.now
         let systemPrompt = VaaniSystemPrompt.build(language: language)
         let tools = toolExecutor.definitions
 
-        var messages = await historyStore.recentMessages()
+        var messages = await historyStore.recentMessages(for: language)
         messages.append(.user(trimmedInput))
 
         let firstTokenState = FirstTokenTracker(startClock: startClock, callback: onFirstToken)
         let sentenceBuffer = SentenceStreamBuffer(callback: onSentenceReady)
 
         var executedTools: [LLMToolCall] = []
+        var executedToolOutputs: [String] = []
         var encounteredErrors: [String] = []
         var finalReply = ""
         var answeringProvider = ""
@@ -279,8 +301,11 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
                     },
                     onTextDelta: { delta in
                         firstTokenState.recordIfNeeded()
-                        onTextDelta?(delta)
-                        sentenceBuffer.append(delta)
+                        let cleanDelta = Self.stripDevanagari(delta)
+                        if !cleanDelta.isEmpty {
+                            onTextDelta?(cleanDelta)
+                            sentenceBuffer.append(cleanDelta)
+                        }
                     }
                 )
 
@@ -307,17 +332,60 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
                         print("[AgentOrchestrator] Tool '\(call.name)' failed: \(error)")
                         toolOutputJSON = #"{"status":"error","message":"Tool execution failed"}"#
                     }
+                    executedToolOutputs.append(toolOutputJSON)
                     messages.append(.toolResult(id: call.id, name: call.name, content: toolOutputJSON))
                 }
             }
+
+            // Deterministic fallback: if a tool succeeded and the final reply is under 3 words or empty, generate the confirmation from the tool result
+            if !executedTools.isEmpty && Self.wordCount(of: finalReply) < 3 {
+                if let fallback = Self.deterministicToolFallbackReply(
+                    executedTools: executedTools,
+                    executedToolOutputs: executedToolOutputs,
+                    language: language
+                ) {
+                    finalReply = fallback
+                    print("[REPLY FALLBACK] tool=\(executedTools.last?.name ?? "unknown") reply=\"\(finalReply)\"")
+                }
+            }
+
+            // Deterministic guard: in English mode, if the reply still contains common Hinglish markers, re-ask once
+            if language == .english && !finalReply.isEmpty && Self.containsHinglishMarkers(finalReply) {
+                print("[LANG GUARD] rewrite triggered")
+                let rewriteResult = try await streamWithProviderFallback(
+                    messages: [.user(finalReply)],
+                    systemPrompt: "Rewrite in plain English only. Keep under 25 words, no Hindi words, no Devanagari, and speak temperatures as '24 degrees'.",
+                    tools: [],
+                    encounteredErrors: &encounteredErrors,
+                    onFirstToken: nil,
+                    onTextDelta: nil
+                )
+                let rewritten = Self.sanitizeSpokenReply(rewriteResult.text)
+                if !rewritten.isEmpty {
+                    finalReply = rewritten
+                    answeringProvider = rewriteResult.providerName
+                    answeringModel = rewriteResult.modelName
+                }
+            }
         } catch {
-            let totalElapsedMs = Self.milliseconds(since: startClock)
-            let toolNames = executedTools.isEmpty ? "none" : executedTools.map(\.name).joined(separator: ",")
-            let errorSummary = encounteredErrors.isEmpty
-                ? LLMError.sanitizeErrorSnippet(error.localizedDescription, maxChars: 400)
-                : encounteredErrors.joined(separator: " | ")
-            print("[LLM DEBUG] provider=none model=none ttfb=- total=\(Int(totalElapsedMs.rounded())) tools=\(toolNames) errors=\(errorSummary)")
-            throw error
+            // If a tool already succeeded in an earlier round before the follow-up LLM call failed, use deterministic fallback
+            if !executedTools.isEmpty,
+               let fallback = Self.deterministicToolFallbackReply(
+                   executedTools: executedTools,
+                   executedToolOutputs: executedToolOutputs,
+                   language: language
+               ) {
+                finalReply = fallback
+                print("[REPLY FALLBACK] tool=\(executedTools.last?.name ?? "unknown") reply=\"\(finalReply)\" (recovered after follow-up error)")
+            } else {
+                let totalElapsedMs = Self.milliseconds(since: startClock)
+                let toolNames = executedTools.isEmpty ? "none" : executedTools.map(\.name).joined(separator: ",")
+                let errorSummary = encounteredErrors.isEmpty
+                    ? LLMError.sanitizeErrorSnippet(error.localizedDescription, maxChars: 400)
+                    : encounteredErrors.joined(separator: " | ")
+                print("[LLM DEBUG] provider=none model=none ttfb=- total=\(Int(totalElapsedMs.rounded())) tools=\(toolNames) errors=\(errorSummary)")
+                throw error
+            }
         }
 
         sentenceBuffer.flushRemaining()
@@ -332,7 +400,7 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         }
 
         if !finalReply.isEmpty {
-            await historyStore.appendTurn(user: trimmedInput, assistant: finalReply)
+            await historyStore.appendTurn(user: trimmedInput, assistant: finalReply, language: language)
         }
 
         return AgentTurnResult(
@@ -341,7 +409,8 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
             totalMs: totalElapsedMs,
             providerName: answeringProvider,
             modelName: answeringModel,
-            executedToolCalls: executedTools
+            executedToolCalls: executedTools,
+            executedToolOutputs: executedToolOutputs
         )
     }
 
@@ -472,14 +541,41 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
 
     // MARK: - Helpers
 
-    /// Strips any residual markdown formatting (`*`, `#`, `` ` ``) and `<think>` blocks so TTS speaks clean text.
+    /// Strips any Devanagari characters (`U+0900`–`U+097F`) from the given string.
+    nonisolated static func stripDevanagari(_ text: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        scalars.reserveCapacity(text.unicodeScalars.count)
+        for scalar in text.unicodeScalars {
+            if !(0x0900...0x097F).contains(scalar.value) {
+                scalars.append(scalar)
+            }
+        }
+        return String(scalars)
+    }
+
+    /// Returns `true` if the text contains common Hinglish markers (`hai`, `hain`, `kal`, `aaj`, `baje`, `subah`, `shaam`, `mein`, `ka`, `ke`, `ki`, `ho gaya`, `kar diya`, `karna`) as whole words.
+    nonisolated static func containsHinglishMarkers(_ text: String) -> Bool {
+        let pattern = #"(?i)\b(hai|hain|kal|aaj|baje|subah|shaam|mein|ka|ke|ki|ho\s+gaya|kar\s+diya|karna)\b"#
+        return text.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// Strips any residual markdown formatting (`*`, `#`, `` ` ``), `<think>` blocks, Devanagari script (`U+0900`–`U+097F`), and degree symbols (`°C` -> `degrees`) so TTS speaks clean text.
     nonisolated static func sanitizeSpokenReply(_ raw: String) -> String {
         var cleaned = raw.replacingOccurrences(
             of: #"(?is)<think>.*?</think>"#,
             with: "",
             options: .regularExpression
         )
+        cleaned = stripDevanagari(cleaned)
+        cleaned = cleaned.replacingOccurrences(
+            of: #"(?i)\s*°\s*[cf]\b"#,
+            with: " degrees",
+            options: .regularExpression
+        )
         cleaned = cleaned
+            .replacingOccurrences(of: "℃", with: " degrees")
+            .replacingOccurrences(of: "℉", with: " degrees")
+            .replacingOccurrences(of: "°", with: " degrees ")
             .replacingOccurrences(of: "**", with: "")
             .replacingOccurrences(of: "__", with: "")
             .replacingOccurrences(of: "`", with: "")
@@ -494,6 +590,191 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
             options: .regularExpression
         )
         return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private nonisolated static func wordCount(of text: String) -> Int {
+        text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+    }
+
+    /// Generates a deterministic spoken confirmation/summary from the last successful tool result when the LLM reply is empty or truncated (< 3 words).
+    public nonisolated static func deterministicToolFallbackReply(
+        executedTools: [LLMToolCall],
+        executedToolOutputs: [String],
+        language: VoiceAgentViewModel.Language,
+        now: Date = Date()
+    ) -> String? {
+        guard let lastCall = executedTools.last,
+              let lastOutput = executedToolOutputs.last,
+              let data = lastOutput.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              json["error"] == nil else {
+            return nil
+        }
+
+        switch lastCall.name {
+        case "set_alarm":
+            guard (json["status"] as? String) == "success" else { return nil }
+            let iso = json["time_iso"] as? String
+            let spoken = (json["time_spoken"] as? String) ?? ""
+            switch language {
+            case .hinglish:
+                let phrase = friendlyHinglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                return "Alarm \(phrase) ke liye set ho gaya."
+            case .english:
+                let phrase = friendlyEnglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                return "Alarm set for \(phrase)."
+            }
+
+        case "set_reminder":
+            guard (json["status"] as? String) == "success" else { return nil }
+            let title = (json["title"] as? String) ?? "Reminder"
+            let iso = (json["datetime_iso"] as? String) ?? (json["due_iso"] as? String)
+            let spoken = (json["datetime_spoken"] as? String) ?? (json["due_spoken"] as? String)
+            switch language {
+            case .hinglish:
+                if let spoken, !spoken.isEmpty {
+                    let phrase = friendlyHinglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                    return "Reminder \(title) \(phrase) ke liye set ho gaya."
+                }
+                return "Reminder \(title) set ho gaya."
+            case .english:
+                if let spoken, !spoken.isEmpty {
+                    let phrase = friendlyEnglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                    return "Reminder for \(title) set for \(phrase)."
+                }
+                return "Reminder for \(title) has been set."
+            }
+
+        case "get_next_meeting":
+            if let noneStr = json["next_meeting"] as? String, noneStr == "none" {
+                return language == .hinglish
+                    ? "Aapki aage koi meeting scheduled nahi hai."
+                    : "You have no upcoming meetings scheduled."
+            }
+            if let meeting = json["next_meeting"] as? [String: Any] {
+                let title = (meeting["title"] as? String) ?? "Meeting"
+                let iso = meeting["start"] as? String
+                let spoken = (meeting["start_spoken"] as? String) ?? ""
+                switch language {
+                case .hinglish:
+                    let phrase = friendlyHinglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                    return "Aapki agli meeting \(title) \(phrase) hai."
+                case .english:
+                    let phrase = friendlyEnglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                    return "Your next meeting is \(title) \(phrase)."
+                }
+            }
+            return nil
+
+        case "get_schedule":
+            let count = (json["meeting_count"] as? Int) ?? 0
+            let meetings = (json["meetings"] as? [[String: Any]]) ?? []
+            let dayDesc = (json["day"] as? String) ?? "today"
+            if count == 0 || meetings.isEmpty {
+                return language == .hinglish
+                    ? "Aapke schedule mein koi meeting nahi hai."
+                    : "You have no meetings scheduled for \(dayDesc)."
+            }
+            let firstThree = meetings.prefix(3).compactMap { m -> String? in
+                guard let t = m["title"] as? String, let s = m["start_spoken"] as? String else { return nil }
+                return "\(t) at \(s)"
+            }.joined(separator: ", ")
+            return language == .hinglish
+                ? "Aapki \(count) \(count == 1 ? "meeting hai" : "meetings hain"): \(firstThree)."
+                : "You have \(count) \(count == 1 ? "meeting" : "meetings"): \(firstThree)."
+
+        case "get_weather":
+            guard json["error"] == nil else { return nil }
+            let city = (json["city"] as? String) ?? "your city"
+            let temp = extractLeadingInt(from: json["temperature"]) ?? (json["current_temp_c"] as? Int) ?? 25
+            let condEn = ((json["condition"] as? String) ?? "clear").lowercased()
+            let condHi = (json["condition_hinglish"] as? String) ?? condEn
+            let high = extractLeadingInt(from: json["high"]) ?? (json["high_c"] as? Int) ?? temp
+            let low = extractLeadingInt(from: json["low"]) ?? (json["low_c"] as? Int) ?? temp
+            let rain = extractLeadingInt(from: json["rain_chance"]) ?? (json["rain_chance_percent"] as? Int) ?? 0
+            switch language {
+            case .hinglish:
+                return "\(city) mein abhi \(temp) degree aur \(condHi) hai, high \(high) degree, low \(low) degree, aur baarish ka chance \(rain) percent hai."
+            case .english:
+                return "In \(city), it is \(temp) degrees and \(condEn), with a high of \(high) degrees, low of \(low) degrees, and \(rain) percent chance of rain."
+            }
+
+        default:
+            return nil
+        }
+    }
+
+    private nonisolated static func extractLeadingInt(from anyValue: Any?) -> Int? {
+        if let intVal = anyValue as? Int { return intVal }
+        if let strVal = anyValue as? String,
+           let match = strVal.range(of: #"-?\d+"#, options: .regularExpression) {
+            return Int(strVal[match])
+        }
+        return nil
+    }
+
+    private nonisolated static func friendlyHinglishTimePhrase(fromISO isoString: String?, spokenFallback: String, now: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        if let isoString, let date = formatter.date(from: isoString) {
+            let calendar = Calendar.current
+            let dayWord: String
+            if calendar.isDate(date, inSameDayAs: now) {
+                dayWord = "aaj"
+            } else if let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)),
+                      calendar.isDate(date, inSameDayAs: tomorrow) {
+                dayWord = "kal"
+            } else {
+                let df = DateFormatter()
+                df.locale = Locale(identifier: "en_US_POSIX")
+                df.dateFormat = "EEEE"
+                dayWord = df.string(from: date)
+            }
+
+            let hour24 = calendar.component(.hour, from: date)
+            let minute = calendar.component(.minute, from: date)
+            let periodWord: String
+            if hour24 >= 4 && hour24 < 12 {
+                periodWord = "subah"
+            } else if hour24 >= 12 && hour24 < 17 {
+                periodWord = "dopahar"
+            } else if hour24 >= 17 && hour24 < 21 {
+                periodWord = "shaam"
+            } else {
+                periodWord = "raat"
+            }
+
+            let hour12 = (hour24 % 12 == 0) ? 12 : (hour24 % 12)
+            let timeStr = (minute == 0) ? "\(hour12) baje" : String(format: "%d:%02d baje", hour12, minute)
+            return "\(dayWord) \(periodWord) \(timeStr)"
+        }
+        return spokenFallback.isEmpty ? "scheduled time" : spokenFallback
+    }
+
+    private nonisolated static func friendlyEnglishTimePhrase(fromISO isoString: String?, spokenFallback: String, now: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        if let isoString, let date = formatter.date(from: isoString) {
+            let calendar = Calendar.current
+            let dayWord: String
+            if calendar.isDate(date, inSameDayAs: now) {
+                dayWord = "today"
+            } else if let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)),
+                      calendar.isDate(date, inSameDayAs: tomorrow) {
+                dayWord = "tomorrow"
+            } else {
+                let df = DateFormatter()
+                df.locale = Locale(identifier: "en_US_POSIX")
+                df.dateFormat = "EEEE, MMMM d"
+                dayWord = df.string(from: date)
+            }
+
+            let hour24 = calendar.component(.hour, from: date)
+            let minute = calendar.component(.minute, from: date)
+            let amPm = hour24 < 12 ? "AM" : "PM"
+            let hour12 = (hour24 % 12 == 0) ? 12 : (hour24 % 12)
+            let timeStr = (minute == 0) ? "\(hour12) \(amPm)" : String(format: "%d:%02d %@", hour12, minute, amPm)
+            return "\(dayWord) at \(timeStr)"
+        }
+        return spokenFallback.isEmpty ? "the requested time" : spokenFallback
     }
 
     private nonisolated static func milliseconds(since start: ContinuousClock.Instant) -> Double {

@@ -103,7 +103,13 @@ public final class VoiceAgentViewModel {
     public var response: String = ""
     
     /// Selected language (English or Hinglish).
-    public var language: Language = .english
+    public var language: Language = .english {
+        didSet {
+            if language != oldValue {
+                resetConversationHistory()
+            }
+        }
+    }
     
     /// Whether the user has explicitly touched a dev TTS engine/strategy toggle in the collapsible Dev section.
     /// When `false` (default), routing is strictly: English -> Apple Isha (en-IN), Hinglish -> Kokoro hf_beta K2 (lang="hi").
@@ -185,6 +191,21 @@ public final class VoiceAgentViewModel {
     public var isKokoroReady: Bool {
         kokoroLoadingState == .ready
     }
+
+    /// Outcome of the latest Calendar demo-data action, shown only in developer controls.
+    public var demoEventsStatus: String?
+
+    /// Currently scheduled Vaani alarms via AlarmKit, shown in the Dev section.
+    public var scheduledAlarms: [VaaniAlarmSummary] = []
+
+    /// Outcome of the latest Dev alarm action (`Test alarm in 1 min` / `Cancel all Vaani alarms`).
+    public var alarmStatusMessage: String?
+
+    /// Non-dev confirmation card note displayed below the response card when an alarm is scheduled.
+    public var lastScheduledAlarmNote: String?
+
+    /// Dev-only counter of K2 lexicon/loanword misses (`[K2 MISS]`).
+    public var k2MissCount: Int = HinglishTransliterator.k2MissCount
     
     // MARK: - Dependencies & Private State
     
@@ -272,7 +293,10 @@ public final class VoiceAgentViewModel {
     public func prepareSpeechToText() {
         validateAPIKeysForBanner()
         prepareTextToSpeech()
+        refreshAlarms()
         #if DEBUG
+        HinglishTransliterator.runDebugSelfTestIfNeeded()
+        k2MissCount = HinglishTransliterator.k2MissCount
         if llmClient is AgentOrchestrator {
             orchestrator.runStartupSelfTestIfNeeded()
         }
@@ -337,6 +361,7 @@ public final class VoiceAgentViewModel {
         appleTTS.stop()
         ttsClient.stop()
         errorMessage = nil
+        lastScheduledAlarmNote = nil
         validateAPIKeysForBanner()
         state = .listening
         
@@ -401,6 +426,7 @@ public final class VoiceAgentViewModel {
         ttsClient.stop()
         audioLevel = 0.0
         errorMessage = nil
+        lastScheduledAlarmNote = nil
         validateAPIKeysForBanner()
         transcript = trimmed
 
@@ -419,6 +445,121 @@ public final class VoiceAgentViewModel {
 
             latency.totalMs = latency.sttMs + latency.llmMs + latency.ttsMs
         }
+    }
+
+    /// Human-readable description of the active TTS engine and voice for the Dev section.
+    public var currentTTSEngineDescription: String {
+        if devTTSOverrideEnabled {
+            switch ttsEngine {
+            case .apple:
+                return "Apple Isha (en-IN) [Override]"
+            case .kokoro:
+                let speaker = (language == .hinglish) ? kokoroHindiSpeakerID : kokoroEnglishSpeakerID
+                return "Kokoro \(speaker) (\(kokoroStrategy.rawValue)) [Override]"
+            }
+        }
+        switch language {
+        case .english:
+            return "Apple Isha (Premium, en-IN) [Locked]"
+        case .hinglish:
+            return kokoroTTS.isReady
+                ? "Kokoro hf_beta (K2 Devanagari) [Locked]"
+                : "Apple Isha (Fallback • Kokoro loading)"
+        }
+    }
+
+    /// Clears any dev TTS override and restores the locked routing (`English = Apple Isha`, `Hinglish = Kokoro hf_beta K2`).
+    public func resetDevTTSOverride() {
+        devTTSOverrideEnabled = false
+        kokoroHindiSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
+        kokoroStrategy = .k2DevanagariMixHi
+        ttsStrategy = .romanizedHiIN
+        ttsEngine = (language == .hinglish) ? .kokoro : .apple
+    }
+
+    /// Clears the conversation history in `AgentOrchestrator` (called automatically when the language toggle changes).
+    public func resetConversationHistory() {
+        Task { [weak self] in
+            await self?.orchestrator.clearHistory()
+        }
+    }
+
+    public func seedDemoEvents() {
+        guard let tools = orchestrator.toolExecutor as? VaaniToolExecutor else {
+            demoEventsStatus = "Real tools are unavailable."
+            return
+        }
+        Task { [weak self] in
+            let result = await tools.seedDemoEvents()
+            self?.demoEventsStatus = result
+        }
+    }
+
+    public func clearDemoEvents() {
+        guard let tools = orchestrator.toolExecutor as? VaaniToolExecutor else {
+            demoEventsStatus = "Real tools are unavailable."
+            return
+        }
+        Task { [weak self] in
+            let result = await tools.clearDemoEvents()
+            self?.demoEventsStatus = result
+        }
+    }
+
+    /// Refreshes the list of scheduled AlarmKit alarms for the Dev section.
+    public func refreshAlarms() {
+        guard let tools = orchestrator.toolExecutor as? VaaniToolExecutor else {
+            scheduledAlarms = []
+            return
+        }
+        scheduledAlarms = tools.fetchScheduledAlarms()
+    }
+
+    /// Schedules a 1-minute test alarm via `VaaniToolExecutor` and refreshes the alarm list.
+    public func testAlarmInOneMinute() {
+        guard let tools = orchestrator.toolExecutor as? VaaniToolExecutor else {
+            alarmStatusMessage = "Real tools are unavailable."
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let jsonResult = await tools.scheduleTestAlarmInOneMinute()
+            self.refreshAlarms()
+            if let note = Self.extractAlarmConfirmationNote(from: jsonResult) {
+                self.lastScheduledAlarmNote = note
+                self.alarmStatusMessage = note
+            } else {
+                self.alarmStatusMessage = jsonResult
+            }
+        }
+    }
+
+    /// Cancels all scheduled Vaani alarms via `VaaniToolExecutor` and refreshes the alarm list.
+    public func cancelAllVaaniAlarms() {
+        guard let tools = orchestrator.toolExecutor as? VaaniToolExecutor else {
+            alarmStatusMessage = "Real tools are unavailable."
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let status = await tools.cancelAllVaaniAlarms()
+            self.alarmStatusMessage = status
+            self.lastScheduledAlarmNote = nil
+            self.refreshAlarms()
+        }
+    }
+
+    private static func extractAlarmConfirmationNote(from jsonString: String) -> String? {
+        guard let data = jsonString.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = dict["status"] as? String,
+              status == "success" else {
+            return nil
+        }
+        let timeText = (dict["time_spoken"] as? String)
+            ?? (dict["time_iso"] as? String)
+            ?? "scheduled time"
+        return "Alarm set for \(timeText) (shows on lock screen when it rings; AlarmKit alarms are not listed in the Clock app)"
     }
     
     /// Cancels any active processing or speaking, returning to idle.
@@ -474,6 +615,7 @@ public final class VoiceAgentViewModel {
 
         self.response = ""
         self.errorMessage = nil
+        self.lastScheduledAlarmNote = nil
         validateAPIKeysForBanner()
 
         do {
@@ -504,6 +646,17 @@ public final class VoiceAgentViewModel {
             latency.llmMs = turnResult.totalMs
             lastAnsweringProvider = "\(turnResult.providerName) • \(turnResult.modelName)"
             self.response = turnResult.reply
+
+            if turnResult.executedToolCalls.contains(where: { $0.name == "set_alarm" }) {
+                refreshAlarms()
+                for (index, toolCall) in turnResult.executedToolCalls.enumerated() where toolCall.name == "set_alarm" {
+                    if index < turnResult.executedToolOutputs.count,
+                       let note = Self.extractAlarmConfirmationNote(from: turnResult.executedToolOutputs[index]) {
+                        self.lastScheduledAlarmNote = note
+                    }
+                }
+            }
+
             return turnResult.reply
         } catch is CancellationError {
             return self.response
@@ -606,6 +759,8 @@ public final class VoiceAgentViewModel {
             errorMessage = error.localizedDescription
         }
         
+        k2MissCount = HinglishTransliterator.k2MissCount
+
         if !Task.isCancelled {
             state = .idle
         }

@@ -60,7 +60,7 @@ nonisolated public struct LLMConfig: Sendable, Equatable {
         groqModel: String = LLMConfig.defaultGroqModel,
         geminiModel: String = LLMConfig.defaultGeminiModel,
         temperature: Double = 0.3,
-        maxTokens: Int = 512,
+        maxTokens: Int = 500,
         timeoutSeconds: TimeInterval = 8.0
     ) {
         self.chain = chain
@@ -288,13 +288,58 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
         }
 
         let modelName = modelOverride ?? config.groqModel
-        let timeoutSec = config.timeoutSeconds
-        let request = try buildURLRequest(
+        let initialMaxTokens = modelName.lowercased().contains("gpt-oss") ? max(config.maxTokens, 500) : config.maxTokens
+
+        let firstAttempt = try await performGroqStream(
             apiKey: rawKey,
             modelName: modelName,
             messages: messages,
             systemPrompt: systemPrompt,
-            tools: tools
+            tools: tools,
+            maxTokens: initialMaxTokens,
+            onFirstToken: onFirstToken,
+            onTextDelta: onTextDelta
+        )
+
+        let wordCount = firstAttempt.result.text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+        if firstAttempt.finishReason == "length",
+           wordCount < 3,
+           firstAttempt.result.toolCalls.isEmpty {
+            print("[LLM DEBUG] Groq finish=length with \(wordCount) words (<3); retrying once with 900 tokens")
+            let retryAttempt = try await performGroqStream(
+                apiKey: rawKey,
+                modelName: modelName,
+                messages: messages,
+                systemPrompt: systemPrompt,
+                tools: tools,
+                maxTokens: 900,
+                onFirstToken: onFirstToken,
+                onTextDelta: onTextDelta
+            )
+            return retryAttempt.result
+        }
+
+        return firstAttempt.result
+    }
+
+    private nonisolated func performGroqStream(
+        apiKey: String,
+        modelName: String,
+        messages: [LLMChatMessage],
+        systemPrompt: String,
+        tools: [LLMToolDefinition],
+        maxTokens: Int,
+        onFirstToken: (@Sendable () -> Void)?,
+        onTextDelta: (@Sendable (String) -> Void)?
+    ) async throws -> (result: LLMStreamResult, finishReason: String?) {
+        let timeoutSec = config.timeoutSeconds
+        let request = try buildURLRequest(
+            apiKey: apiKey,
+            modelName: modelName,
+            messages: messages,
+            systemPrompt: systemPrompt,
+            tools: tools,
+            maxTokens: maxTokens
         )
 
         return try await withLLMTimeout(provider: .groq, model: modelName, seconds: timeoutSec) { [session] in
@@ -320,12 +365,14 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
                 if httpResponse.statusCode == 400,
                    let recoveredCall = Self.recoverGroqFailedToolGeneration(from: errorBody) {
                     onFirstToken?()
-                    return LLMStreamResult(
+                    print("[LLM DEBUG] finish=tool_calls_recovered chars=0")
+                    let recoveredResult = LLMStreamResult(
                         text: "",
                         toolCalls: [recoveredCall],
                         providerName: LLMProvider.groq.rawValue,
                         modelName: modelName
                     )
+                    return (recoveredResult, "tool_calls")
                 }
 
                 let errorSnippet = Self.errorBodySnippet(errorBody)
@@ -340,6 +387,7 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
             var accumulatedText = ""
             var didEmitFirstToken = false
             var insideThinkTag = false
+            var finishReason: String? = nil
 
             struct PartialToolCall {
                 var id: String = ""
@@ -369,8 +417,15 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
                 }
 
                 guard let choices = json["choices"] as? [[String: Any]],
-                      let firstChoice = choices.first,
-                      let delta = firstChoice["delta"] as? [String: Any] else {
+                      let firstChoice = choices.first else {
+                    continue
+                }
+
+                if let reason = firstChoice["finish_reason"] as? String, !reason.isEmpty {
+                    finishReason = reason
+                }
+
+                guard let delta = firstChoice["delta"] as? [String: Any] else {
                     continue
                 }
 
@@ -423,12 +478,15 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
             let cleanedText = Self.stripCompletedThinkBlocks(from: accumulatedText)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
-            return LLMStreamResult(
+            print("[LLM DEBUG] finish=\(finishReason ?? "unknown") chars=\(cleanedText.count)")
+
+            let streamResult = LLMStreamResult(
                 text: cleanedText,
                 toolCalls: finalizedToolCalls,
                 providerName: LLMProvider.groq.rawValue,
                 modelName: modelName
             )
+            return (streamResult, finishReason)
         }
     }
 
@@ -437,7 +495,8 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
         modelName: String,
         messages: [LLMChatMessage],
         systemPrompt: String,
-        tools: [LLMToolDefinition]
+        tools: [LLMToolDefinition],
+        maxTokens: Int
     ) throws -> URLRequest {
         var openAIMessages: [[String: Any]] = [
             [
@@ -493,7 +552,7 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
             "model": modelName,
             "messages": openAIMessages,
             "temperature": config.temperature,
-            "max_completion_tokens": config.maxTokens,
+            "max_completion_tokens": maxTokens,
             "stream": true
         ]
 
@@ -652,31 +711,54 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
         let timeoutSec = config.timeoutSeconds
 
         do {
-            return try await performStreamRequest(
+            let attempt = try await performStreamRequest(
                 apiKey: rawKey,
                 modelName: modelName,
                 messages: messages,
                 systemPrompt: systemPrompt,
                 tools: tools,
                 includeThinkingConfig: true,
+                maxTokens: config.maxTokens,
                 timeoutSec: timeoutSec,
                 onFirstToken: onFirstToken,
                 onTextDelta: onTextDelta
             )
+            let wordCount = attempt.result.text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+            if (attempt.finishReason == "MAX_TOKENS" || attempt.finishReason == "length"),
+               wordCount < 3,
+               attempt.result.toolCalls.isEmpty {
+                print("[LLM DEBUG] Gemini finish=\(attempt.finishReason ?? "MAX_TOKENS") with \(wordCount) words (<3); retrying once with 900 tokens")
+                let retry = try await performStreamRequest(
+                    apiKey: rawKey,
+                    modelName: modelName,
+                    messages: messages,
+                    systemPrompt: systemPrompt,
+                    tools: tools,
+                    includeThinkingConfig: true,
+                    maxTokens: 900,
+                    timeoutSec: timeoutSec,
+                    onFirstToken: onFirstToken,
+                    onTextDelta: onTextDelta
+                )
+                return retry.result
+            }
+            return attempt.result
         } catch let LLMError.httpError(_, _, statusCode, _) where statusCode == 400 {
             // If Gemini 3.x returns 400 for the thinkingConfig parameter, retry once without thinkingConfig
             print("[GeminiClient] HTTP 400 with thinkingConfig on \(modelName); retrying once without thinkingConfig")
-            return try await performStreamRequest(
+            let fallbackAttempt = try await performStreamRequest(
                 apiKey: rawKey,
                 modelName: modelName,
                 messages: messages,
                 systemPrompt: systemPrompt,
                 tools: tools,
                 includeThinkingConfig: false,
+                maxTokens: config.maxTokens,
                 timeoutSec: timeoutSec,
                 onFirstToken: onFirstToken,
                 onTextDelta: onTextDelta
             )
+            return fallbackAttempt.result
         }
     }
 
@@ -687,17 +769,19 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
         systemPrompt: String,
         tools: [LLMToolDefinition],
         includeThinkingConfig: Bool,
+        maxTokens: Int,
         timeoutSec: TimeInterval,
         onFirstToken: (@Sendable () -> Void)?,
         onTextDelta: (@Sendable (String) -> Void)?
-    ) async throws -> LLMStreamResult {
+    ) async throws -> (result: LLMStreamResult, finishReason: String?) {
         let request = try buildURLRequest(
             apiKey: apiKey,
             modelName: modelName,
             messages: messages,
             systemPrompt: systemPrompt,
             tools: tools,
-            includeThinkingConfig: includeThinkingConfig
+            includeThinkingConfig: includeThinkingConfig,
+            maxTokens: maxTokens
         )
 
         return try await withLLMTimeout(provider: .gemini, model: modelName, seconds: timeoutSec) { [session] in
@@ -730,6 +814,7 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
             var accumulatedText = ""
             var collectedToolCalls: [LLMToolCall] = []
             var didEmitFirstToken = false
+            var finishReason: String? = nil
 
             for try await rawLine in bytes.lines {
                 try Task.checkCancellation()
@@ -757,8 +842,15 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                 }
 
                 guard let candidates = json["candidates"] as? [[String: Any]],
-                      let firstCandidate = candidates.first,
-                      let content = firstCandidate["content"] as? [String: Any],
+                      let firstCandidate = candidates.first else {
+                    continue
+                }
+
+                if let reason = firstCandidate["finishReason"] as? String, !reason.isEmpty {
+                    finishReason = reason
+                }
+
+                guard let content = firstCandidate["content"] as? [String: Any],
                       let parts = content["parts"] as? [[String: Any]] else {
                     continue
                 }
@@ -806,12 +898,16 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                 }
             }
 
-            return LLMStreamResult(
-                text: accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines),
+            let cleanedText = accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+            print("[LLM DEBUG] finish=\(finishReason ?? "unknown") chars=\(cleanedText.count)")
+
+            let streamResult = LLMStreamResult(
+                text: cleanedText,
                 toolCalls: collectedToolCalls,
                 providerName: LLMProvider.gemini.rawValue,
                 modelName: modelName
             )
+            return (streamResult, finishReason)
         }
     }
 
@@ -821,7 +917,8 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
         messages: [LLMChatMessage],
         systemPrompt: String,
         tools: [LLMToolDefinition],
-        includeThinkingConfig: Bool
+        includeThinkingConfig: Bool,
+        maxTokens: Int
     ) throws -> URLRequest {
         let encodedModel = modelName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? modelName
         guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(encodedModel):streamGenerateContent?alt=sse") else {
@@ -900,7 +997,7 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
 
         var generationConfig: [String: Any] = [
             "temperature": config.temperature,
-            "maxOutputTokens": config.maxTokens
+            "maxOutputTokens": maxTokens
         ]
         // Gemini 3.x models always reason: do not send thinkingBudget: 0. Flash-Lite's lowest level is MINIMAL.
         if includeThinkingConfig {

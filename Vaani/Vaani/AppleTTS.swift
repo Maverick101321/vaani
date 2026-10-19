@@ -625,6 +625,12 @@ nonisolated public enum HinglishTransliterator {
         // Common English loanwords spoken by the assistant
         "meeting": "मीटिंग",
         "meetings": "मीटिंग्स",
+        "standup": "स्टैंडअप",
+        "sync": "सिंक",
+        "team": "टीम",
+        "product": "प्रोडक्ट",
+        "design": "डिज़ाइन",
+        "review": "रिव्यू",
         "reminder": "रिमाइंडर",
         "reminders": "रिमाइंडर्स",
         "alarm": "अलार्म",
@@ -636,9 +642,22 @@ nonisolated public enum HinglishTransliterator {
         "degree": "डिग्री",
         "degrees": "डिग्री",
         "temperature": "टेम्परेचर",
-        "forecast": "फ़ोरकास्ट",
-        "today": "आज",
-        "tomorrow": "कल",
+        "forecast": "फोरकास्ट",
+        "drizzle": "ड्रिज़ल",
+        "overcast": "ओवरकास्ट",
+        "cloudy": "क्लाउडी",
+        "sunny": "सनी",
+        "clear": "क्लियर",
+        "rain": "रेन",
+        "thunderstorm": "थंडरस्टॉर्म",
+        "fog": "फॉग",
+        "snow": "स्नो",
+        "humidity": "ह्यूमिडिटी",
+        "wind": "विंड",
+        "high": "हाई",
+        "low": "लो",
+        "today": "टुडे",
+        "tomorrow": "टुमॉरो",
         "yesterday": "कल",
         "celsius": "सेल्सियस",
         "fahrenheit": "फ़ारेनहाइट",
@@ -673,19 +692,142 @@ nonisolated public enum HinglishTransliterator {
         "afternoon": "दोपहर",
         "evening": "शाम",
         "night": "रात",
-        "humidity": "ह्यूमिडिटी",
-        "percent": "प्रतिशत",
-        "percentage": "प्रतिशत",
+        "percent": "पर्सेंट",
+        "percentage": "पर्सेंट",
+        "minus": "माइनस",
+        "am": "ए एम",
+        "pm": "पी एम",
         "ok": "ओके",
         "okay": "ओके",
         "please": "प्लीज़",
         "sorry": "सॉरी",
         "thank": "थैंक",
-        "thanks": "थैंक्स"
+        "thanks": "थैंक्स",
+
+        // Additional Hindi romanized spelling variants for weather & time
+        "mosam": "मौसम",
+        "aasman": "आसमान",
+        "asman": "आसमान",
+        "chhaye": "छाए",
+        "chaye": "छाए",
+        "aandhi": "आँधी",
+        "andhi": "आँधी",
+        "boondabandi": "बूंदाबांदी",
+        "dhundh": "धुंध",
+        "ola": "ओले",
+        "ole": "ओले",
+        "baraf": "बर्फ़",
+        "barf": "बर्फ़",
+        "padegi": "पड़ेगी",
+        "padenge": "पड़ेंगे"
     ]
 
-    /// Converts numbers, temperatures, and clock times (e.g., "5 PM" -> "शाम 5 बजे", "24 degrees" -> "24 डिग्री")
-    /// into speakable Hindi/Devanagari form before token-level transliteration.
+    /// Full irregular Hindi number word table for `0...100`.
+    private static let hindiNumbers0To100: [String] = [
+        "शून्य", "एक", "दो", "तीन", "चार", "पाँच", "छह", "सात", "आठ", "नौ", "दस",
+        "ग्यारह", "बारह", "तेरह", "चौदह", "पंद्रह", "सोलह", "सत्रह", "अठारह", "उन्नीस", "बीस",
+        "इक्कीस", "बाईस", "तेईस", "चौबीस", "पच्चीस", "छब्बीस", "सत्ताईस", "अट्ठाईस", "उनतीस", "तीस",
+        "इकतीस", "बत्तीस", "तैंतीस", "चौंतीस", "पैंतीस", "छत्तीस", "सैंतीस", "अड़तीस", "उनतालीस", "चालीस",
+        "इकतालीस", "बयालीस", "तैंतालीस", "चवालीस", "पैंतालीस", "छियालीस", "सैंतालीस", "अड़तालीस", "उनचास", "पचास",
+        "इक्यावन", "बावन", "तिरेपन", "चौवन", "पचपन", "छप्पन", "सत्तावन", "अट्ठावन", "उनसठ", "साठ",
+        "इकसठ", "बासठ", "तिरसठ", "चौंसठ", "पैंसठ", "छियासठ", "सड़सठ", "अड़सठ", "उनहत्तर", "सत्तर",
+        "इकहत्तर", "बहत्तर", "तिहत्तर", "चौहत्तर", "पचहत्तर", "छिहत्तर", "सतहत्तर", "अठहत्तर", "उनासी", "अस्सी",
+        "इक्यासी", "बयासी", "तिरासी", "चौरासी", "पचासी", "छियासी", "सत्तासी", "अट्ठासी", "नवासी", "नब्बे",
+        "इक्यानवे", "बानवे", "तिरानवे", "चौरानवे", "पचानवे", "छियानवे", "सत्तानवे", "अट्ठानवे", "निन्यानवे", "सौ"
+    ]
+
+    /// Converts an integer into Hindi number words (`0...100` irregular table, plus hundreds up to `999` and negatives).
+    public static func hindiNumber(_ n: Int) -> String {
+        if n < 0 {
+            return "माइनस \(hindiNumber(abs(n)))"
+        }
+        if n <= 100 {
+            return hindiNumbers0To100[n]
+        }
+        if n <= 999 {
+            let hundreds = n / 100
+            let remainder = n % 100
+            if remainder == 0 {
+                return "\(hindiNumbers0To100[hundreds]) सौ"
+            } else {
+                return "\(hindiNumbers0To100[hundreds]) सौ \(hindiNumbers0To100[remainder])"
+            }
+        }
+        if n <= 99_999 {
+            let thousands = n / 1000
+            let remainder = n % 1000
+            if remainder == 0 {
+                return "\(hindiNumber(thousands)) हज़ार"
+            } else {
+                return "\(hindiNumber(thousands)) हज़ार \(hindiNumber(remainder))"
+            }
+        }
+        return String(n)
+    }
+
+    /// Converts a decimal or integer numeric string (optionally negative) into Hindi words.
+    /// Examples: `"28.5"` -> `"अट्ठाईस दशमलव पाँच"`, `"-4"` -> `"माइनस चार"`, `"33"` -> `"तैंतीस"`.
+    private static func hindiNumericString(_ raw: String) -> String {
+        var str = raw.trimmingCharacters(in: .whitespaces)
+        var isNegative = false
+        if str.hasPrefix("-") {
+            isNegative = true
+            str.removeFirst()
+        } else if str.hasPrefix("+") {
+            str.removeFirst()
+        }
+
+        let spoken: String
+        if let dotIndex = str.firstIndex(of: ".") {
+            let intPartStr = String(str[..<dotIndex])
+            let fracPartStr = String(str[str.index(after: dotIndex)...])
+            let intWords = Int(intPartStr).map { hindiNumber($0) } ?? intPartStr
+            let fracDigits = fracPartStr.compactMap { char -> String? in
+                guard let digit = Int(String(char)) else { return nil }
+                return hindiNumber(digit)
+            }
+            if fracDigits.isEmpty {
+                spoken = intWords
+            } else {
+                spoken = "\(intWords) दशमलव \(fracDigits.joined(separator: " "))"
+            }
+        } else if let intVal = Int(str) {
+            spoken = hindiNumber(intVal)
+        } else {
+            spoken = str
+        }
+
+        return isNegative ? "माइनस \(spoken)" : spoken
+    }
+
+    // MARK: - K2 Miss Tracking
+
+    private static let missLock = NSLock()
+    private static var _k2MissCount: Int = 0
+
+    /// Total count of ASCII tokens missed by K2 dictionary lookup across the session.
+    public static var k2MissCount: Int {
+        missLock.lock()
+        defer { missLock.unlock() }
+        return _k2MissCount
+    }
+
+    /// Resets the K2 miss counter to zero.
+    public static func resetK2MissCount() {
+        missLock.lock()
+        _k2MissCount = 0
+        missLock.unlock()
+    }
+
+    private static func recordK2Miss(_ word: String) {
+        missLock.lock()
+        _k2MissCount += 1
+        missLock.unlock()
+        print("[K2 MISS] word=\(word)")
+    }
+
+    /// Converts numbers, decimals, percentages, temperatures, and clock times into speakable Hindi/Devanagari words
+    /// before token-level transliteration.
     public static func normalizeSpeakableNumbersAndTimes(_ text: String) -> String {
         var result = text
 
@@ -698,9 +840,9 @@ nonisolated public enum HinglishTransliterator {
             )
         }
 
-        // 2. Clock times with AM / PM (e.g. "5 PM" -> "शाम 5 बजे", "7:30 AM" -> "सुबह 7 बजकर 30 मिनट")
+        // 2. Clock times with AM / PM (e.g. "7 AM" -> "सात ए एम", "7:30 PM" -> "सात बजकर तीस मिनट पी एम")
         if let timeRegex = try? NSRegularExpression(
-            pattern: "\\b(\\d{1,2})(?::(\\d{2}))?\\s*([AaPp]\\.?[Mm]\\.?)\\b",
+            pattern: "\\b(\\d{1,2})(?::(\\d{2}))?\\s*([AaPp])\\.?[Mm]\\.?\\b",
             options: []
         ) {
             let matches = timeRegex.matches(in: result, range: NSRange(result.startIndex..., in: result))
@@ -721,47 +863,29 @@ nonisolated public enum HinglishTransliterator {
                     minute = 0
                 }
 
-                let isPM = result[ampmRange].lowercased().hasPrefix("p")
-                let periodWord: String
-                if isPM {
-                    if hour == 12 || (hour >= 1 && hour <= 3) {
-                        periodWord = "दोपहर"
-                    } else if hour >= 4 && hour <= 7 {
-                        periodWord = "शाम"
-                    } else {
-                        periodWord = "रात"
-                    }
-                } else {
-                    if hour == 12 || (hour >= 1 && hour <= 3) {
-                        periodWord = "रात"
-                    } else {
-                        periodWord = "सुबह"
-                    }
-                }
-
-                let prefixCheck = result[..<fullRange.lowerBound].trimmingCharacters(in: .whitespaces).lowercased()
-                let hasLeadingPeriod = prefixCheck.hasSuffix("subah") || prefixCheck.hasSuffix("सुबह")
-                    || prefixCheck.hasSuffix("dopahar") || prefixCheck.hasSuffix("दोपहर")
-                    || prefixCheck.hasSuffix("shaam") || prefixCheck.hasSuffix("शाम")
-                    || prefixCheck.hasSuffix("raat") || prefixCheck.hasSuffix("रात")
-
-                let suffixCheck = result[fullRange.upperBound...].trimmingCharacters(in: .whitespaces).lowercased()
-                let hasTrailingBaje = suffixCheck.hasPrefix("baje") || suffixCheck.hasPrefix("बजे")
-
-                let effectivePrefix = hasLeadingPeriod ? "" : "\(periodWord) "
+                let isPM = result[ampmRange].lowercased() == "p"
+                let ampmSpoken = isPM ? "पी एम" : "ए एम"
+                let hourWords = hindiNumber(hour)
                 let spokenTime: String
                 if minute > 0 {
-                    spokenTime = "\(effectivePrefix)\(hour) बजकर \(minute) मिनट"
+                    spokenTime = "\(hourWords) बजकर \(hindiNumber(minute)) मिनट \(ampmSpoken)"
                 } else {
-                    let bajeSuffix = hasTrailingBaje ? "" : " बजे"
-                    spokenTime = "\(effectivePrefix)\(hour)\(bajeSuffix)"
+                    spokenTime = "\(hourWords) \(ampmSpoken)"
                 }
 
                 result.replaceSubrange(fullRange, with: spokenTime)
             }
         }
 
-        // 3. Colon clock times without AM/PM (e.g. "7:30" -> "7 बजकर 30 मिनट", "7:00" -> "7 बजे")
+        // 3. Standalone AM / PM tokens (e.g. "A.M." / "P.M." / "AM" / "PM")
+        if let amRegex = try? NSRegularExpression(pattern: "\\b[Aa]\\.[Mm]\\.?", options: []) {
+            result = amRegex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "ए एम")
+        }
+        if let pmRegex = try? NSRegularExpression(pattern: "\\b[Pp]\\.[Mm]\\.?", options: []) {
+            result = pmRegex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "पी एम")
+        }
+
+        // 4. Colon clock times without AM/PM (e.g. "7:30" -> "सात बजकर तीस मिनट", "7:00" -> "सात बजे")
         if let colonTimeRegex = try? NSRegularExpression(pattern: "\\b(\\d{1,2}):(\\d{2})\\b", options: []) {
             let matches = colonTimeRegex.matches(in: result, range: NSRange(result.startIndex..., in: result))
             for match in matches.reversed() {
@@ -772,20 +896,19 @@ nonisolated public enum HinglishTransliterator {
                       let minute = Int(result[minRange]) else {
                     continue
                 }
-                let replacement = (minute > 0) ? "\(hour) बजकर \(minute) मिनट" : "\(hour) बजे"
+                let hourWords = hindiNumber(hour)
+                let replacement = (minute > 0) ? "\(hourWords) बजकर \(hindiNumber(minute)) मिनट" : "\(hourWords) बजे"
                 result.replaceSubrange(fullRange, with: replacement)
             }
         }
 
-        // 4. Temperature and degree patterns (e.g. "24 degrees Celsius" -> "24 डिग्री सेल्सियस", "24 degrees" -> "24 डिग्री", "24°C" -> "24 डिग्री सेल्सियस")
+        // 5. Temperature, degree, and percent patterns (e.g. "24°C" -> "24 डिग्री सेल्सियस", "14%" -> "14 पर्सेंट")
         let unitPatterns: [(String, String)] = [
-            ("(\\d+(?:\\.\\d+)?)\\s*°\\s*[Cc]\\b", "$1 डिग्री सेल्सियस"),
-            ("(\\d+(?:\\.\\d+)?)\\s*°\\s*[Ff]\\b", "$1 डिग्री फ़ारेनहाइट"),
-            ("(\\d+(?:\\.\\d+)?)\\s*degrees?\\s+celsius\\b", "$1 डिग्री सेल्सियस"),
-            ("(\\d+(?:\\.\\d+)?)\\s*degrees?\\s+fahrenheit\\b", "$1 डिग्री फ़ारेनहाइट"),
-            ("(\\d+(?:\\.\\d+)?)\\s*degrees?\\b", "$1 डिग्री"),
-            ("(\\d+(?:\\.\\d+)?)\\s*°", "$1 डिग्री"),
-            ("(\\d+(?:\\.\\d+)?)\\s*%", "$1 प्रतिशत")
+            ("(-?\\d+(?:\\.\\d+)?)\\s*°\\s*[Cc]\\b", "$1 डिग्री सेल्सियस"),
+            ("(-?\\d+(?:\\.\\d+)?)\\s*°\\s*[Ff]\\b", "$1 डिग्री फ़ारेनहाइट"),
+            ("(-?\\d+(?:\\.\\d+)?)\\s*°", "$1 डिग्री"),
+            ("(-?\\d+(?:\\.\\d+)?)\\s*%", "$1 पर्सेंट"),
+            ("%", " पर्सेंट ")
         ]
 
         for (pattern, template) in unitPatterns {
@@ -798,12 +921,59 @@ nonisolated public enum HinglishTransliterator {
             }
         }
 
+        // 6. All remaining numbers (negative, decimal, or integer: e.g. "-5", "28.5", "26", "7") -> Hindi number words
+        if let numberRegex = try? NSRegularExpression(pattern: "(?<![\\w.])(-?\\d+(?:\\.\\d+)?)\\b", options: []) {
+            let matches = numberRegex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+            for match in matches.reversed() {
+                guard let fullRange = Range(match.range, in: result),
+                      let numRange = Range(match.range(at: 1), in: result) else {
+                    continue
+                }
+                let rawNumber = String(result[numRange])
+                let hindiWords = hindiNumericString(rawNumber)
+                result.replaceSubrange(fullRange, with: hindiWords)
+            }
+        }
+
         return result
+    }
+
+    /// Looks up a single lowercased ASCII word in `commonHindiWords` with plural (`-s`, `-es`, `-ies`) tolerance.
+    private static func lookupWord(_ lowercasedWord: String) -> String? {
+        if let direct = commonHindiWords[lowercasedWord] {
+            return direct
+        }
+        // Plural tolerance: -ies -> -y (e.g., "cities" -> "city")
+        if lowercasedWord.count > 3, lowercasedWord.hasSuffix("ies") {
+            let singular = String(lowercasedWord.dropLast(3)) + "y"
+            if let match = commonHindiWords[singular] {
+                return match
+            }
+        }
+        // Plural tolerance: -es (e.g., "matches", "degrees", "watches")
+        if lowercasedWord.count > 3, lowercasedWord.hasSuffix("es") {
+            let drop2 = String(lowercasedWord.dropLast(2))
+            if let match = commonHindiWords[drop2] {
+                return match
+            }
+            let drop1 = String(lowercasedWord.dropLast(1))
+            if let match = commonHindiWords[drop1] {
+                return match
+            }
+        }
+        // Plural tolerance: -s (e.g., "forecasts", "clouds", "standups", "percents")
+        if lowercasedWord.count > 2, lowercasedWord.hasSuffix("s"), !lowercasedWord.hasSuffix("ss") {
+            let singular = String(lowercasedWord.dropLast(1))
+            if let match = commonHindiWords[singular] {
+                return match
+            }
+        }
+        return nil
     }
 
     /// HEURISTIC: Normalizes numbers/times and transliterates Romanized Hindi words, Indian cities/places,
     /// and common English assistant loanwords into Devanagari.
-    public static func transliterate(_ text: String) -> String {
+    public static func transliterate(_ text: String, logMisses: Bool = true) -> String {
         let normalized = normalizeSpeakableNumbersAndTimes(text)
         let lines = normalized.components(separatedBy: .newlines)
         return lines.map { line in
@@ -834,14 +1004,61 @@ nonisolated public enum HinglishTransliterator {
                 let coreWord = String(token[startIndex..<endIndex])
                 let trailingPunct = String(token[endIndex...])
 
+                // Support hyphenated compounds (e.g. "aandhi-toofan")
+                if coreWord.contains("-") {
+                    let parts = coreWord.split(separator: "-", omittingEmptySubsequences: false).map { partSub -> String in
+                        let part = String(partSub)
+                        let key = part.lowercased()
+                        if let mapped = lookupWord(key) {
+                            return mapped
+                        }
+                        if logMisses,
+                           !key.isEmpty,
+                           key.unicodeScalars.allSatisfy({ $0.isASCII && CharacterSet.letters.contains($0) }) {
+                            recordK2Miss(key)
+                        }
+                        return part
+                    }
+                    return leadingPunct + parts.joined(separator: "-") + trailingPunct
+                }
+
                 let lookupKey = coreWord.lowercased()
-                if let devanagariWord = commonHindiWords[lookupKey] {
+                if let devanagariWord = lookupWord(lookupKey) {
                     return leadingPunct + devanagariWord + trailingPunct
+                }
+                if logMisses,
+                   lookupKey.unicodeScalars.allSatisfy({ $0.isASCII && CharacterSet.letters.contains($0) }) {
+                    recordK2Miss(lookupKey)
                 }
                 return token
             }.joined(separator: " ")
         }.joined(separator: "\n")
     }
+
+    #if DEBUG
+    private static let selfTestLock = NSLock()
+    private static var didRunDebugSelfTest = false
+
+    /// Runs the Phase 5 round 2 unit-style K2 text-prep self-test once at app startup in DEBUG builds.
+    public static func runDebugSelfTestIfNeeded() {
+        selfTestLock.lock()
+        guard !didRunDebugSelfTest else {
+            selfTestLock.unlock()
+            return
+        }
+        didRunDebugSelfTest = true
+        selfTestLock.unlock()
+
+        let samples = [
+            "Hyderabad ka aaj ka mosam overcast hai, temperature 26 degrees, high 33, low 24, barish ka chance 14 percent.",
+            "Alarm kal subah 7 baje ke liye set ho gaya."
+        ]
+        for (idx, sample) in samples.enumerated() {
+            let output = transliterate(sample, logMisses: true)
+            print("[K2 SELF-TEST \(idx + 1)] in=\"\(sample)\" -> out=\"\(output)\"")
+        }
+    }
+    #endif
 }
 
 // MARK: - On-Device Apple TTS Service

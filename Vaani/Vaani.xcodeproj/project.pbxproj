@@ -18,9 +18,22 @@
 		8BB65F8930843D3500A93C22 /* onnxruntime.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = onnxruntime.xcframework; path = "Staging/build-ios/ios-onnxruntime/1.27.0/onnxruntime.xcframework"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		8B85A6F630864C840072FCF6 /* Exceptions for "Vaani" folder in "Vaani" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 000000000000000100000000 /* Vaani */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		000000000000000000000010 /* Vaani */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				8B85A6F630864C840072FCF6 /* Exceptions for "Vaani" folder in "Vaani" target */,
+			);
 			path = Vaani;
 			sourceTree = "<group>";
 		};
@@ -299,7 +312,11 @@
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Vaani/Info.plist;
+				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Vaani reads your calendar to tell you your schedule and next meeting.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Vaani uses your location to give local weather.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Vaani needs the microphone to hear your voice commands.";
+				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Vaani creates reminders when you ask.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -341,7 +358,11 @@
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Vaani/Info.plist;
+				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Vaani reads your calendar to tell you your schedule and next meeting.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Vaani uses your location to give local weather.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Vaani needs the microphone to hear your voice commands.";
+				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Vaani creates reminders when you ask.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;

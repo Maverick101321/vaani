@@ -4,6 +4,9 @@ import SwiftUI
 /// Defaults to `false` so only the language toggle and mic appear on the main screen.
 nonisolated public let kDevTools: Bool = true
 
+/// When `true`, `get_schedule` and `get_next_meeting` read ONLY the `"Vaani Demo"` calendar so personal events are never read aloud.
+nonisolated public let kDemoCalendarOnly: Bool = true
+
 struct ContentView: View {
     @State private var viewModel = VoiceAgentViewModel()
     @State private var isShowingTTSLab = false
@@ -205,25 +208,25 @@ struct ContentView: View {
     private var devControlsSection: some View {
         DisclosureGroup(isExpanded: $isDevSectionExpanded) {
             VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text(
-                        viewModel.devTTSOverrideEnabled
-                            ? "Custom dev TTS override active"
-                            : "Default: En → Apple Isha • Hinglish → Kokoro hf_beta (K2)"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(viewModel.devTTSOverrideEnabled ? .orange : .secondary)
+                HStack(alignment: .center, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Current TTS: \(viewModel.currentTTSEngineDescription)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(viewModel.devTTSOverrideEnabled ? .orange : .primary)
+                        Text("Locked default: En → Apple Isha • Hinglish → Kokoro hf_beta (K2)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
 
                     Spacer()
 
-                    if viewModel.devTTSOverrideEnabled {
-                        Button("Reset") {
-                            viewModel.devTTSOverrideEnabled = false
-                            viewModel.kokoroHindiSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
-                            viewModel.kokoroStrategy = .k2DevanagariMixHi
-                        }
-                        .font(.caption.weight(.semibold))
+                    Button("Reset override") {
+                        viewModel.resetDevTTSOverride()
                     }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(!viewModel.devTTSOverrideEnabled)
                 }
 
                 HStack {
@@ -267,6 +270,10 @@ struct ContentView: View {
 
                     Spacer()
 
+                    Text("K2 Misses: \(viewModel.k2MissCount)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(viewModel.k2MissCount > 0 ? .orange : .secondary)
+
                     Button {
                         isShowingTTSLab = true
                     } label: {
@@ -275,6 +282,102 @@ struct ContentView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                }
+
+                Divider()
+
+                HStack(spacing: 8) {
+                    Button("Seed demo events") {
+                        viewModel.seedDemoEvents()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button("Clear demo events", role: .destructive) {
+                        viewModel.clearDemoEvents()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Spacer()
+                }
+
+                if let status = viewModel.demoEventsStatus {
+                    Text(status)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Divider()
+
+                // MARK: - Dev Alarms Subsection
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label("Alarms (AlarmKit)", systemImage: "alarm.fill")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+
+                        Spacer()
+
+                        Button {
+                            viewModel.refreshAlarms()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+
+                    if viewModel.scheduledAlarms.isEmpty {
+                        Text("No active AlarmKit alarms scheduled.")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        ForEach(viewModel.scheduledAlarms) { alarm in
+                            HStack(spacing: 6) {
+                                Text(String(alarm.id.uuidString.prefix(8)))
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                Text("•")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                Text(alarm.timeDescription)
+                                    .font(.caption2.weight(.medium))
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(alarm.stateDescription)
+                                    .font(.caption2.monospaced())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                            }
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Test alarm in 1 min") {
+                            viewModel.testAlarmInOneMinute()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button("Cancel all Vaani alarms", role: .destructive) {
+                            viewModel.cancelAllVaaniAlarms()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Spacer()
+                    }
+
+                    if let alarmStatus = viewModel.alarmStatusMessage {
+                        Text(alarmStatus)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                    }
                 }
             }
             .padding(.top, 10)
@@ -298,6 +401,11 @@ struct ContentView: View {
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.purple)
                 }
+            }
+        }
+        .onChange(of: isDevSectionExpanded) { _, expanded in
+            if expanded {
+                viewModel.refreshAlarms()
             }
         }
         .padding(14)
@@ -381,6 +489,28 @@ struct ContentView: View {
                 placeholder: "Agent response will appear here...",
                 accentColor: .purple
             )
+
+            // Non-dev Alarm Confirmation Card (below response card)
+            if let alarmNote = viewModel.lastScheduledAlarmNote {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "alarm.waves.left.and.right.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(.orange)
+                        .padding(.top, 2)
+
+                    Text(alarmNote)
+                        .font(.footnote)
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(12)
+                .background(Color(uiColor: .secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.orange.opacity(0.25), lineWidth: 1)
+                )
+            }
         }
     }
     
@@ -911,7 +1041,7 @@ struct TTSLabView: View {
                     Text("Devanagari Mix Preview (\(HinglishTransliterator.commonHindiWords.count) Hindi words dict):")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    Text(HinglishTransliterator.transliterate(customText))
+                    Text(HinglishTransliterator.transliterate(customText, logMisses: false))
                         .font(.footnote)
                         .foregroundStyle(.blue)
                 }
