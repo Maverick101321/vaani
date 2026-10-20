@@ -155,6 +155,8 @@
 			shellScript = (
 				"# Type a script or drag a script file from your workspace to insert its path.",
 				"   rsync -a --delete \"$SRCROOT/Staging/kokoro-int8-multi-lang-v1_0/\" \"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/kokoro-int8-multi-lang-v1_0/\"",
+				"   mkdir -p \"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/openai_whisper-small\"",
+				"rsync -a --delete \"$SRCROOT/Staging/openai_whisper-small/\" \"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/openai_whisper-small/\"",
 				"",
 			);
 		};
@@ -304,6 +306,7 @@
 		000000000000000111000000 /* Debug configuration for PBXNativeTarget "Vaani" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = G36M242925;
@@ -350,6 +353,7 @@
 		000000000000000112000000 /* Release configuration for PBXNativeTarget "Vaani" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = G36M242925;
