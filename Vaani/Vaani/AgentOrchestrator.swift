@@ -722,9 +722,10 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
                 switch language {
                 case .hinglish:
                     let phrase = friendlyHinglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                    let sentenceInitialPhrase = phrase.prefix(1).uppercased() + phrase.dropFirst()
                     let templates = [
                         "Alarm already set for \(phrase).",
-                        "\(phrase.capitalized) ka alarm pehle se already set hai.",
+                        "\(sentenceInitialPhrase) ka alarm pehle se already set hai.",
                         "Aapka alarm \(phrase) ke liye already set hai."
                     ]
                     return templates[seed % templates.count]

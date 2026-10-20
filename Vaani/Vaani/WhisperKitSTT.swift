@@ -81,9 +81,42 @@ nonisolated public final class WhisperKitSTT: SpeechToText, Sendable {
 }
 
 private actor WhisperKitStore {
+    static let modelFolderName = "openai_whisper-small"
+
     private var whisperKit: WhisperKit?
     private var cachedHinglishPromptTokens: [Int]?
     private var isPreparing = false
+
+    private static func resolveBundledModelFolder(modelName: String) -> String? {
+        let fm = FileManager.default
+        guard let resourceRoot = Bundle.main.resourcePath else {
+            return nil
+        }
+
+        let variantFolder = modelName.hasPrefix("openai_whisper-") ? modelName : "openai_whisper-\(modelName)"
+        let candidates = [
+            (resourceRoot as NSString).appendingPathComponent(variantFolder),
+            (resourceRoot as NSString).appendingPathComponent(Self.modelFolderName),
+            resourceRoot
+        ]
+
+        let requiredModels = [
+            "MelSpectrogram.mlmodelc",
+            "AudioEncoder.mlmodelc",
+            "TextDecoder.mlmodelc"
+        ]
+
+        for candidate in candidates {
+            let hasAllRequired = requiredModels.allSatisfy { item in
+                let path = (candidate as NSString).appendingPathComponent(item)
+                return fm.fileExists(atPath: path)
+            }
+            if hasAllRequired {
+                return candidate
+            }
+        }
+        return nil
+    }
 
     func prepare(config: STTConfig, stateHandler: @escaping @MainActor @Sendable (STTLoadingState) -> Void) async throws {
         if whisperKit != nil {
@@ -95,17 +128,31 @@ private actor WhisperKitStore {
         isPreparing = true
         defer { isPreparing = false }
 
-        await stateHandler(.downloading)
         do {
-            // `load: false` exposes download and model-loading as distinct UI states.
-            let kit = try await WhisperKit(
-                model: config.modelName,
-                verbose: false,
-                prewarm: false,
-                load: false,
-                download: true
-            )
-            await stateHandler(.loading)
+            let kit: WhisperKit
+            if let bundledFolder = Self.resolveBundledModelFolder(modelName: config.modelName) {
+                print("[WhisperKitSTT] Verified bundled model folder at \(bundledFolder)")
+                await stateHandler(.loading)
+                kit = try await WhisperKit(
+                    model: config.modelName,
+                    modelFolder: bundledFolder,
+                    verbose: false,
+                    prewarm: false,
+                    load: false,
+                    download: false
+                )
+            } else {
+                print("[WhisperKitSTT] Bundled folder \(Self.modelFolderName) not found in bundle; falling back to download")
+                await stateHandler(.downloading)
+                kit = try await WhisperKit(
+                    model: config.modelName,
+                    verbose: false,
+                    prewarm: false,
+                    load: false,
+                    download: true
+                )
+                await stateHandler(.loading)
+            }
             try await kit.prewarmModels()
             try await kit.loadModels()
             if let tokenizer = kit.tokenizer {

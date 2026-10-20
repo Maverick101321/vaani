@@ -1,3 +1,20 @@
+# Staged models and frameworks
 Staging/
+*.onnx
+*.mlmodelc/
+*.mlpackage/
+*.tar.bz2
+openai_whisper-*/
+kokoro-int8-multi-lang-v1_0/
+
+# Local API secrets (keep Secrets.example.swift tracked)
 Secrets.swift
 Vaani/Secrets.swift
+!Secrets.example.swift
+
+# Xcode & macOS artifacts
+.DS_Store
+build/
+DerivedData/
+*.xcuserdata/
+xcuserdata/
