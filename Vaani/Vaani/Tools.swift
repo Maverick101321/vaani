@@ -188,33 +188,41 @@ nonisolated public enum VaaniToolDefinitions {
         ),
         LLMToolDefinition(
             name: "set_reminder",
-            description: "Create a reminder with a title and scheduled ISO-8601 datetime.",
+            description: "Create a reminder with a title, target day, and 24-hour time.",
             properties: [
                 "title": LLMToolParameterProperty(
                     type: "string",
                     description: "Title or subject of the reminder, e.g. meeting, call mom."
                 ),
-                "datetime_iso": LLMToolParameterProperty(
+                "day": LLMToolParameterProperty(
                     type: "string",
-                    description: "ISO-8601 datetime or time string, e.g. 2026-10-19T17:00:00+05:30 or 17:00."
+                    description: "Target day: 'today', 'tomorrow', 'day_after', a weekday name (e.g. 'Wednesday'), or 'YYYY-MM-DD'. Use 'tomorrow' when the user says 'kal' or 'tomorrow'; 'day_after' for 'parso'."
+                ),
+                "time": LLMToolParameterProperty(
+                    type: "string",
+                    description: "24-hour time in 'HH:mm' format, e.g. '17:00' or '07:00'."
                 )
             ],
-            required: ["title", "datetime_iso"]
+            required: ["title", "day", "time"]
         ),
         LLMToolDefinition(
             name: "set_alarm",
-            description: "Set an alarm for a specific ISO time or 24-hour time with an optional label.",
+            description: "Set an alarm for a target day and 24-hour time with an optional label.",
             properties: [
-                "time_iso": LLMToolParameterProperty(
+                "day": LLMToolParameterProperty(
                     type: "string",
-                    description: "Alarm time in ISO-8601 or HH:mm format, e.g. 07:00 or 2026-10-20T07:00:00+05:30."
+                    description: "Target day: 'today', 'tomorrow', 'day_after', a weekday name (e.g. 'Wednesday'), or 'YYYY-MM-DD'. Use 'tomorrow' when the user says 'kal' or 'tomorrow'; 'day_after' for 'parso'."
+                ),
+                "time": LLMToolParameterProperty(
+                    type: "string",
+                    description: "Alarm time in 24-hour 'HH:mm' format, e.g. '07:00' or '18:30'."
                 ),
                 "label": LLMToolParameterProperty(
                     type: "string",
                     description: "Label for the alarm, e.g. Morning workout, Wake up."
                 )
             ],
-            required: ["time_iso", "label"]
+            required: ["day", "time", "label"]
         ),
         LLMToolDefinition(
             name: "get_schedule",
@@ -348,10 +356,29 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
 
     public var definitions: [LLMToolDefinition] { Self.defaultDefinitions }
 
+    private let hintLock = NSLock()
+    private var _currentTurnTranscriptHint: String = ""
+
+    /// Optional transcript from the current user turn so relative day cues ("kal"/"tomorrow", "parso")
+    /// are honored even if the LLM omits `day` or passes `"today"`.
+    public var currentTurnTranscriptHint: String {
+        get {
+            hintLock.lock()
+            defer { hintLock.unlock() }
+            return _currentTurnTranscriptHint
+        }
+        set {
+            hintLock.lock()
+            _currentTurnTranscriptHint = newValue
+            hintLock.unlock()
+        }
+    }
+
     public init() {}
 
     public func execute(call: LLMToolCall) async throws -> String {
         let started = ContinuousClock.now
+        let transcriptHint = currentTurnTranscriptHint
         let result: String
         switch call.name {
         case "get_weather":
@@ -361,12 +388,29 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
 
         case "set_reminder":
             let title = call.stringArgument("title", default: "Meeting")
-            result = await Self.createReminder(title: title, datetimeISO: call.stringArgument("datetime_iso"))
+            let day = call.stringArgument("day")
+            let time = call.stringArgument("time")
+            let legacyISO = call.stringArgument("datetime_iso")
+            result = await Self.createReminder(
+                title: title,
+                day: day,
+                time: time,
+                legacyISO: legacyISO,
+                transcriptHint: transcriptHint
+            )
 
         case "set_alarm":
-            let timeISO = call.stringArgument("time_iso")
+            let day = call.stringArgument("day")
+            let time = call.stringArgument("time")
+            let legacyISO = call.stringArgument("time_iso")
             let label = call.stringArgument("label", default: "Alarm")
-            result = await Self.createAlarm(timeISO: timeISO, label: label)
+            result = await Self.createAlarm(
+                day: day,
+                time: time,
+                legacyISO: legacyISO,
+                label: label,
+                transcriptHint: transcriptHint
+            )
 
         case "get_schedule":
             let day = call.stringArgument("day", default: "today")
@@ -400,6 +444,8 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
 
     // MARK: - Dev Alarm Inspection & Controls
 
+    @MainActor private static var scheduledAlarmDates: [Date] = []
+
     @MainActor public func fetchScheduledAlarms() -> [VaaniAlarmSummary] {
         guard #available(iOS 26.0, *) else { return [] }
         do {
@@ -418,6 +464,7 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
     }
 
     @MainActor public func cancelAllVaaniAlarms() async -> String {
+        Self.scheduledAlarmDates.removeAll()
         var cancelledAlarmKitCount = 0
         if #available(iOS 26.0, *) {
             if let alarms = try? AlarmManager.shared.alarms {
@@ -451,7 +498,13 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
     @MainActor public func scheduleTestAlarmInOneMinute() async -> String {
         let targetDate = Date().addingTimeInterval(60)
         let isoTarget = Self.localISO(targetDate)
-        return await Self.createAlarm(timeISO: isoTarget, label: "Vaani Test Alarm")
+        return await Self.createAlarm(
+            day: "today",
+            time: "",
+            legacyISO: isoTarget,
+            label: "Vaani Test Alarm",
+            transcriptHint: ""
+        )
     }
 
     // MARK: - Weather & Geocoding
@@ -619,8 +672,21 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
 
     // MARK: - EventKit and AlarmKit
 
-    @MainActor private static func createReminder(title: String, datetimeISO: String) async -> String {
-        guard let date = dateTime(datetimeISO) else { return json(["error": "invalid_datetime"]) }
+    @MainActor private static func createReminder(
+        title: String,
+        day: String,
+        time: String,
+        legacyISO: String = "",
+        transcriptHint: String = ""
+    ) async -> String {
+        guard let date = resolveDayAndTime(
+            day: day,
+            time: time,
+            legacyISO: legacyISO,
+            transcriptHint: transcriptHint
+        ) else {
+            return json(["error": "invalid_datetime"])
+        }
         let store = EKEventStore()
         do {
             guard try await store.requestFullAccessToReminders() else { return json(["error": "reminders_access_denied"]) }
@@ -634,6 +700,7 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
                 "status": "success",
                 "action": "reminder_created",
                 "title": title,
+                "day_relative": relativeDayLabel(for: date),
                 "datetime_spoken": spokenDateTime(date),
                 "datetime_iso": localISO(date)
             ])
@@ -642,19 +709,78 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
         }
     }
 
-    @MainActor private static func createAlarm(timeISO: String, label: String) async -> String {
-        guard let date = dateTime(timeISO) else {
-            print("[ALARM DEBUG] createAlarm failed: invalid_datetime for input=\"\(timeISO)\"")
-            return json(["error": "invalid_datetime", "input": timeISO])
+    @MainActor private static func hasExistingAlarmWithinOneMinute(of targetDate: Date) async -> Bool {
+        if scheduledAlarmDates.contains(where: { abs($0.timeIntervalSince(targetDate)) <= 60.0 }) {
+            return true
+        }
+        if #available(iOS 26.0, *) {
+            if let alarms = try? AlarmManager.shared.alarms {
+                for alarm in alarms {
+                    guard let schedule = alarm.schedule else { continue }
+                    if case .fixed(let existingDate) = schedule,
+                       abs(existingDate.timeIntervalSince(targetDate)) <= 60.0 {
+                        return true
+                    }
+                }
+            }
+        }
+        let center = UNUserNotificationCenter.current()
+        let pending = await center.pendingNotificationRequests()
+        let calendar = Calendar.current
+        for req in pending where req.identifier.hasPrefix("vaani-alarm-") {
+            if let calTrigger = req.trigger as? UNCalendarNotificationTrigger {
+                let comps = calTrigger.dateComponents
+                if comps.year != nil, comps.month != nil, comps.day != nil,
+                   let exactDate = calendar.date(from: comps),
+                   abs(exactDate.timeIntervalSince(targetDate)) <= 60.0 {
+                    return true
+                } else if let nextDate = calTrigger.nextTriggerDate(),
+                          abs(nextDate.timeIntervalSince(targetDate)) <= 60.0 {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    @MainActor private static func createAlarm(
+        day: String,
+        time: String,
+        legacyISO: String = "",
+        label: String,
+        transcriptHint: String = ""
+    ) async -> String {
+        guard let date = resolveDayAndTime(
+            day: day,
+            time: time,
+            legacyISO: legacyISO,
+            transcriptHint: transcriptHint
+        ) else {
+            let inputDesc = !time.isEmpty ? "day=\(day) time=\(time)" : legacyISO
+            print("[ALARM DEBUG] createAlarm failed: invalid_datetime for input=\"\(inputDesc)\"")
+            return json(["error": "invalid_datetime", "input": inputDesc])
         }
         guard date > Date() else {
             print("[ALARM DEBUG] createAlarm failed: alarm_time_in_past for resolved=\(localISO(date))")
             return json(["error": "alarm_time_in_past", "resolved_iso": localISO(date)])
         }
 
-        let usageDescription = Bundle.main.object(forInfoDictionaryKey: "NSAlarmKitUsageDescription") as? String
         let resolvedISO = localISO(date)
         let resolvedSpoken = spokenDateTime(date)
+        let dayRelative = relativeDayLabel(for: date)
+
+        if await hasExistingAlarmWithinOneMinute(of: date) {
+            print("[ALARM DEBUG] duplicate alarm within +/-1 min detected for resolved=\(resolvedISO) spoken=\"\(resolvedSpoken)\"")
+            return json([
+                "status": "already_exists",
+                "day_relative": dayRelative,
+                "time_iso": resolvedISO,
+                "time_spoken": resolvedSpoken,
+                "label": label
+            ])
+        }
+
+        let usageDescription = Bundle.main.object(forInfoDictionaryKey: "NSAlarmKitUsageDescription") as? String
         let alarmUUID = UUID()
 
         if #available(iOS 26.0, *) {
@@ -696,11 +822,13 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
                     )
                 }
 
+                scheduledAlarmDates.append(date)
                 return json([
                     "status": "success",
                     "action": "alarm_set",
                     "engine": "AlarmKit",
                     "alarm_id": alarmUUID.uuidString,
+                    "day_relative": dayRelative,
                     "time_spoken": resolvedSpoken,
                     "time_iso": resolvedISO,
                     "label": label
@@ -721,6 +849,7 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
         let center = UNUserNotificationCenter.current()
         let resolvedISO = localISO(date)
         let resolvedSpoken = spokenDateTime(date)
+        let dayRelative = relativeDayLabel(for: date)
         do {
             guard try await center.requestAuthorization(options: [.alert, .sound]) else {
                 return json(["error": "alarm_access_denied", "fallback": "UNUserNotificationCenter", "reason": reason])
@@ -736,6 +865,7 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
             )
             let reqID = "vaani-alarm-\(UUID().uuidString)"
             try await center.add(UNNotificationRequest(identifier: reqID, content: content, trigger: trigger))
+            scheduledAlarmDates.append(date)
             print("[ALARM DEBUG] Fell back to UNUserNotificationCenter id=\(reqID) reason=\(reason) resolved=\(resolvedISO)")
             return json([
                 "status": "success",
@@ -743,6 +873,7 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
                 "engine": "UNUserNotificationCenter",
                 "fallback": "UNUserNotificationCenter",
                 "reason": reason,
+                "day_relative": dayRelative,
                 "time_spoken": resolvedSpoken,
                 "time_iso": resolvedISO,
                 "label": label
@@ -890,6 +1021,199 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
 
     // MARK: - Date, Relative Time & Spoken Formatting
 
+    /// Resolves `(day, time)` in the user's local timezone for `set_alarm` and `set_reminder`.
+    /// - `"today"` / `"aaj"` -> today (`today + 0`)
+    /// - `"tomorrow"` / `"kal"` -> tomorrow (`today + 1`)
+    /// - `"day_after"` / `"parso"` -> day after tomorrow (`today + 2`)
+    /// - Weekday name -> next occurrence of that weekday
+    /// - `YYYY-MM-DD` -> explicit calendar date
+    /// - If `day` is omitted and the time has already passed today, uses tomorrow (`today + 1`).
+    /// - Also checks `transcriptHint` so if the user's spoken request explicitly said `"kal"`/`"tomorrow"` or `"parso"`,
+    ///   it overrides an accidental `"today"` or empty `day` from the LLM.
+    public static func resolveDayAndTime(
+        day: String,
+        time: String,
+        legacyISO: String = "",
+        transcriptHint: String = "",
+        now: Date = Date()
+    ) -> Date? {
+        let calendar = Calendar.current
+        let todayStart = calendar.startOfDay(for: now)
+
+        let rawDay = day.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawTime = time.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawLegacy = legacyISO.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerHint = transcriptHint.lowercased()
+
+        // Determine effective day token, honoring explicit "kal"/"tomorrow" or "parso" in the user's transcript
+        var effectiveDay = rawDay
+        let normalizedRawDay = rawDay
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s-]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if lowerHint.range(of: #"\b(parso|parson|day\s+after\s+tomorrow)\b"#, options: .regularExpression) != nil || lowerHint.contains("परसों") {
+            if normalizedRawDay.isEmpty || normalizedRawDay == "today" || normalizedRawDay == "aaj" {
+                effectiveDay = "day_after"
+            }
+        } else if lowerHint.range(of: #"\b(kal|tomorrow)\b"#, options: .regularExpression) != nil || lowerHint.contains("कल") {
+            if normalizedRawDay.isEmpty || normalizedRawDay == "today" || normalizedRawDay == "aaj" {
+                effectiveDay = "tomorrow"
+            }
+        }
+
+        // If time was omitted and legacyISO was provided (e.g. dev 1-min test alarm or legacy call), resolve via dateTime
+        if rawTime.isEmpty && !rawLegacy.isEmpty {
+            guard var parsed = dateTime(rawLegacy, now: now) else { return nil }
+            let effNorm = effectiveDay.lowercased()
+            if effNorm == "tomorrow" || effNorm == "kal" {
+                let comps = calendar.dateComponents([.hour, .minute, .second], from: parsed)
+                if let tomorrowDay = calendar.date(byAdding: .day, value: 1, to: todayStart),
+                   let adjusted = calendar.date(
+                       bySettingHour: comps.hour ?? 7,
+                       minute: comps.minute ?? 0,
+                       second: comps.second ?? 0,
+                       of: tomorrowDay
+                   ) {
+                    parsed = adjusted
+                }
+            } else if effNorm == "day_after" || effNorm == "parso" {
+                let comps = calendar.dateComponents([.hour, .minute, .second], from: parsed)
+                if let parsoDay = calendar.date(byAdding: .day, value: 2, to: todayStart),
+                   let adjusted = calendar.date(
+                       bySettingHour: comps.hour ?? 7,
+                       minute: comps.minute ?? 0,
+                       second: comps.second ?? 0,
+                       of: parsoDay
+                   ) {
+                    parsed = adjusted
+                }
+            }
+            let dayLog = effectiveDay.isEmpty ? "omitted" : effectiveDay
+            let timeLog = rawTime.isEmpty ? rawLegacy : rawTime
+            print("[ALARM] day=\(dayLog) time=\(timeLog) resolved=\(localISO(parsed))")
+            return parsed
+        }
+
+        // Parse hour and minute from `time` (or fallback to `rawDay` if LLM combined them)
+        let timeSource = !rawTime.isEmpty ? rawTime : rawDay
+        let lowerTime = "\(effectiveDay) \(timeSource) \(transcriptHint)".lowercased()
+        guard let (rawHour, rawMinute) = extractHourAndMinute(from: timeSource.lowercased()) ?? extractHourAndMinute(from: lowerTime) else {
+            if !rawLegacy.isEmpty, let fallback = dateTime(rawLegacy, now: now) {
+                print("[ALARM] day=\(effectiveDay) time=\(rawLegacy) resolved=\(localISO(fallback))")
+                return fallback
+            }
+            return nil
+        }
+
+        var hour = rawHour
+        let minute = rawMinute
+
+        // If hour is 1..11 and no explicit 24h leading-zero >=13, check meridiem cues in time string or transcript
+        let timeLowerOnly = timeSource.lowercased()
+        if timeLowerOnly.range(of: #"\b(pm|p\.m\.|shaam|sham|evening|dopahar|afternoon)\b"#, options: .regularExpression) != nil {
+            if hour < 12 { hour += 12 }
+        } else if timeLowerOnly.range(of: #"\b(am|a\.m\.|subah|morning)\b"#, options: .regularExpression) != nil {
+            if hour == 12 { hour = 0 }
+        } else if hour < 12 && !timeSource.hasPrefix("0") {
+            // Check transcript hint if the LLM passed a bare 12-hour number like "5:00" for "5 PM" / "shaam 5 baje"
+            if lowerHint.range(of: #"\b(pm|p\.m\.|shaam|sham|evening|dopahar|afternoon)\b"#, options: .regularExpression) != nil &&
+               lowerHint.range(of: #"\b(am|a\.m\.|subah|morning)\b"#, options: .regularExpression) == nil {
+                hour += 12
+            } else if lowerHint.range(of: #"\b(raat|night)\b"#, options: .regularExpression) != nil && hour >= 5 {
+                hour += 12
+            }
+        }
+
+        guard (0...23).contains(hour), (0...59).contains(minute) else { return nil }
+
+        // Resolve target calendar day
+        let normDay = effectiveDay
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s-]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let baseDay: Date
+        let hasExplicitDay: Bool
+        var isWeekdayTarget = false
+
+        if normDay.isEmpty {
+            baseDay = todayStart
+            hasExplicitDay = false
+        } else if normDay == "today" || normDay == "aaj" || normDay == "आज" {
+            baseDay = todayStart
+            hasExplicitDay = true
+        } else if normDay == "tomorrow" || normDay == "kal" || normDay == "कल" {
+            baseDay = calendar.date(byAdding: .day, value: 1, to: todayStart) ?? todayStart
+            hasExplicitDay = true
+        } else if normDay == "day after" || normDay == "day after tomorrow" || normDay == "parso" || normDay == "parson" || normDay == "परसों" {
+            baseDay = calendar.date(byAdding: .day, value: 2, to: todayStart) ?? todayStart
+            hasExplicitDay = true
+        } else if let targetWeekday = weekdayNumber(for: normDay) {
+            let currentWeekday = calendar.component(.weekday, from: todayStart)
+            let delta = (targetWeekday - currentWeekday + 7) % 7
+            baseDay = calendar.date(byAdding: .day, value: delta, to: todayStart) ?? todayStart
+            hasExplicitDay = true
+            isWeekdayTarget = true
+        } else if let parsedDay = dayOnly(effectiveDay) {
+            baseDay = calendar.startOfDay(for: parsedDay)
+            hasExplicitDay = true
+        } else {
+            baseDay = todayStart
+            hasExplicitDay = false
+        }
+
+        guard var candidate = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: baseDay) else {
+            return nil
+        }
+
+        // If the resolved time is in the past:
+        // - When `day` was omitted (or "today"), roll to tomorrow
+        // - When `day` was a weekday name and today is that weekday with time passed, roll +7 days
+        if candidate <= now {
+            if isWeekdayTarget {
+                if let nextWeek = calendar.date(byAdding: .day, value: 7, to: candidate) {
+                    candidate = nextWeek
+                }
+            } else if !hasExplicitDay || calendar.isDate(candidate, inSameDayAs: now) {
+                if let tomorrow = calendar.date(byAdding: .day, value: 1, to: candidate) {
+                    candidate = tomorrow
+                }
+            }
+        }
+
+        let dayLog = effectiveDay.isEmpty ? "omitted" : effectiveDay
+        let timeLog = String(format: "%02d:%02d", hour, minute)
+        print("[ALARM] day=\(dayLog) time=\(timeLog) resolved=\(localISO(candidate))")
+        return candidate
+    }
+
+    /// Returns `"today"`, `"tomorrow"`, `"day_after"`, or the English weekday name (`"Wednesday"`) for `date` relative to `now`.
+    public static func relativeDayLabel(for date: Date, now: Date = Date()) -> String {
+        let calendar = Calendar.current
+        let todayStart = calendar.startOfDay(for: now)
+        let targetStart = calendar.startOfDay(for: date)
+        let dayDiff = calendar.dateComponents([.day], from: todayStart, to: targetStart).day ?? 0
+        switch dayDiff {
+        case 0:
+            return "today"
+        case 1:
+            return "tomorrow"
+        case 2:
+            return "day_after"
+        default:
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = .current
+            formatter.dateFormat = "EEEE"
+            return formatter.string(from: date)
+        }
+    }
+
     /// Resolves ISO-8601 dates, 24-hour times, and relative Hinglish/English phrases (`"kal subah 7 baje"`, `"aaj shaam 6 baje"`, bare `"7"` rolling to next occurrence).
     public static func dateTime(_ text: String, now: Date = Date()) -> Date? {
         let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -932,7 +1256,7 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
 
         // 4. Relative day + time phrases ("kal subah 7 baje", "aaj shaam 6 baje", "7:00", "7 AM", "5 PM", bare "7")
         var dayOffset: Int? = nil
-        if lower.range(of: #"\b(parso|parson|day\s+after\s+tomorrow)\b"#, options: .regularExpression) != nil || lower.contains("परसों") {
+        if lower.range(of: #"\b(parso|parson|day\s+after\s+tomorrow|day_after)\b"#, options: .regularExpression) != nil || lower.contains("परसों") {
             dayOffset = 2
         } else if lower.range(of: #"\b(kal|tomorrow)\b"#, options: .regularExpression) != nil || lower.contains("कल") {
             dayOffset = 1
@@ -1050,6 +1374,7 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
         let today = calendar.startOfDay(for: now)
         let normalized = day
             .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: #"[^\p{L}\p{N}\s-]"#, with: " ", options: .regularExpression)
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1059,7 +1384,7 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
             start = today
         } else if normalized == "tomorrow" || normalized == "kal" || normalized == "कल" {
             start = calendar.date(byAdding: .day, value: 1, to: today) ?? today
-        } else if normalized == "parso" || normalized == "parson" || normalized == "day after tomorrow" || normalized == "परसों" {
+        } else if normalized == "parso" || normalized == "parson" || normalized == "day after" || normalized == "day after tomorrow" || normalized == "परसों" {
             start = calendar.date(byAdding: .day, value: 2, to: today) ?? today
         } else if let targetWeekday = weekdayNumber(for: normalized) {
             let currentWeekday = calendar.component(.weekday, from: today)
@@ -1139,12 +1464,23 @@ nonisolated public final class VaaniToolExecutor: ToolExecutor, @unchecked Senda
         return formatter.string(from: date)
     }
 
-    public static func spokenDateTime(_ date: Date) -> String {
+    public static func spokenDateTime(_ date: Date, now: Date = Date()) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = .current
         formatter.dateFormat = "EEEE, MMMM d 'at' h:mm a"
-        return formatter.string(from: date)
+        let base = formatter.string(from: date)
+        let rel = relativeDayLabel(for: date, now: now)
+        switch rel {
+        case "today":
+            return "today, \(base)"
+        case "tomorrow":
+            return "tomorrow, \(base)"
+        case "day_after":
+            return "day after tomorrow, \(base)"
+        default:
+            return base
+        }
     }
 
     public static func localISO(_ date: Date) -> String {

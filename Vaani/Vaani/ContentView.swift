@@ -378,6 +378,42 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(3)
                     }
+
+                Divider()
+
+                HStack(spacing: 8) {
+                    Button {
+                        viewModel.startOfflineEchoTest()
+                    } label: {
+                        Label(
+                            viewModel.isOfflineEchoActive ? "Stop offline echo" : "Offline echo test",
+                            systemImage: "airplane"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!viewModel.isSTTReady && !viewModel.isOfflineEchoActive)
+
+                    Button("Copy results CSV") {
+                        viewModel.copyResultsCSV()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Spacer()
+                }
+
+                if viewModel.isOfflineEchoActive {
+                    Label("Offline mode: STT + TTS running on-device", systemImage: "checkmark.shield.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+
+                if let csvStatus = viewModel.csvCopyStatus {
+                    Text(csvStatus)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 }
             }
             .padding(.top, 10)
@@ -582,11 +618,15 @@ struct ContentView: View {
             }
             
             HStack(spacing: 8) {
+                latencyMetricPill(label: "Response time", ms: viewModel.latency.totalMs, isHighlighted: true)
+                latencyMetricPill(label: "Full reply done", ms: viewModel.latency.fullReplyDoneMs)
+            }
+
+            HStack(spacing: 8) {
                 latencyMetricPill(label: "STT", ms: viewModel.latency.sttMs)
                 latencyMetricPill(label: "LLM 1st", ms: viewModel.latency.llmFirstTokenMs)
                 latencyMetricPill(label: "LLM", ms: viewModel.latency.llmTotalMs)
                 latencyMetricPill(label: "TTS 1st", ms: viewModel.latency.ttsMs)
-                latencyMetricPill(label: "Total", ms: viewModel.latency.totalMs, isHighlighted: true)
             }
         }
         .padding(14)
@@ -759,6 +799,7 @@ struct TTSLabView: View {
 
     @State private var customText: String = "Aaj mausam bilkul suhana hai, lagbhag 24 degrees."
     @State private var selectedKokoroSpeakerID: Int = KokoroSpeaker.defaultHindiSpeakerID
+    @State private var setPronunciation: HinglishTransliterator.SetPronunciation = HinglishTransliterator.setPronunciation
     @State private var isPlaying: Bool = false
     @State private var firstAudioMs: Double?
     @State private var synthMs: Double?
@@ -1038,7 +1079,7 @@ struct TTSLabView: View {
 
             if isDevanagariPreviewActive && !customText.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Devanagari Mix Preview (\(HinglishTransliterator.commonHindiWords.count) Hindi words dict):")
+                    Text("Devanagari Mix Preview (\(HinglishTransliterator.commonHindiWords.count) Hindi words dict, \"set\" → \(setPronunciation.rawValue)):")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text(HinglishTransliterator.transliterate(customText, logMisses: false))
@@ -1049,6 +1090,62 @@ struct TTSLabView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.blue.opacity(0.08))
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("K2 \"set\" Pronunciation (A/B)", systemImage: "waveform.badge.magnifyingglass")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                    Spacer()
+                }
+
+                Picker("K2 set pronunciation", selection: $setPronunciation) {
+                    ForEach(HinglishTransliterator.SetPronunciation.allCases) { variant in
+                        Text(variant.displayLabel).tag(variant)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: setPronunciation) { _, newValue in
+                    HinglishTransliterator.setPronunciation = newValue
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        setPronunciation = .set
+                        HinglishTransliterator.setPronunciation = .set
+                        customText = "Alarm kal subah 7 baje ke liye set ho gaya."
+                        playCurrentText()
+                    } label: {
+                        Label("Hear \"सेट\" (Default)", systemImage: "speaker.wave.2.fill")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Color.blue.opacity(0.12))
+                            .foregroundStyle(.blue)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        setPronunciation = .sait
+                        HinglishTransliterator.setPronunciation = .sait
+                        customText = "Alarm kal subah 7 baje ke liye set ho gaya."
+                        playCurrentText()
+                    } label: {
+                        Label("Hear \"सैट\" (Alt)", systemImage: "speaker.wave.2.fill")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Color.purple.opacity(0.12))
+                            .foregroundStyle(.purple)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
         .padding(16)

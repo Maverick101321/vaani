@@ -425,44 +425,67 @@ nonisolated public final class GroqClient: LLMClient, Sendable {
                     finishReason = reason
                 }
 
-                guard let delta = firstChoice["delta"] as? [String: Any] else {
-                    continue
-                }
-
-                // NOTE: `delta["reasoning"]` is intentionally ignored so reasoning tokens never reach UI or TTS.
-                if let contentDelta = delta["content"] as? String, !contentDelta.isEmpty {
-                    let filteredDelta = Self.stripThinkTags(from: contentDelta, insideThinkTag: &insideThinkTag)
-                    if !filteredDelta.isEmpty {
-                        if !didEmitFirstToken {
-                            didEmitFirstToken = true
-                            onFirstToken?()
+                if let delta = firstChoice["delta"] as? [String: Any] {
+                    // NOTE: `delta["reasoning"]` is intentionally ignored so reasoning tokens never reach UI or TTS.
+                    if let contentDelta = delta["content"] as? String, !contentDelta.isEmpty {
+                        let filteredDelta = Self.stripThinkTags(from: contentDelta, insideThinkTag: &insideThinkTag)
+                        if !filteredDelta.isEmpty {
+                            if !didEmitFirstToken {
+                                didEmitFirstToken = true
+                                onFirstToken?()
+                            }
+                            accumulatedText += filteredDelta
+                            if toolCallsByIndex.isEmpty {
+                                onTextDelta?(filteredDelta)
+                            }
                         }
-                        accumulatedText += filteredDelta
-                        onTextDelta?(filteredDelta)
+                    }
+
+                    if let rawToolCalls = delta["tool_calls"] as? [[String: Any]] {
+                        for tc in rawToolCalls {
+                            if !didEmitFirstToken {
+                                didEmitFirstToken = true
+                                onFirstToken?()
+                            }
+                            let index = (tc["index"] as? Int) ?? 0
+                            var current = toolCallsByIndex[index] ?? PartialToolCall()
+                            if let id = tc["id"] as? String, !id.isEmpty {
+                                current.id = id
+                            }
+                            if let fn = tc["function"] as? [String: Any] {
+                                if let nameChunk = fn["name"] as? String, !nameChunk.isEmpty {
+                                    current.name += nameChunk
+                                }
+                                if let argsChunk = fn["arguments"] as? String, !argsChunk.isEmpty {
+                                    current.arguments += argsChunk
+                                }
+                            }
+                            toolCallsByIndex[index] = current
+                        }
                     }
                 }
 
-                if let rawToolCalls = delta["tool_calls"] as? [[String: Any]] {
-                    for tc in rawToolCalls {
-                        if !didEmitFirstToken {
-                            didEmitFirstToken = true
-                            onFirstToken?()
-                        }
-                        let index = (tc["index"] as? Int) ?? 0
-                        var current = toolCallsByIndex[index] ?? PartialToolCall()
-                        if let id = tc["id"] as? String, !id.isEmpty {
-                            current.id = id
-                        }
-                        if let fn = tc["function"] as? [String: Any] {
-                            if let nameChunk = fn["name"] as? String, !nameChunk.isEmpty {
-                                current.name += nameChunk
-                            }
-                            if let argsChunk = fn["arguments"] as? String, !argsChunk.isEmpty {
-                                current.arguments += argsChunk
-                            }
-                        }
-                        toolCallsByIndex[index] = current
+                // A single Groq tool call streams its JSON arguments in deltas. As soon as the
+                // JSON object is complete, return it to the orchestrator instead of waiting for
+                // trailing SSE finish events; this starts the tool round immediately.
+                let hasOneCompleteToolCall: Bool = {
+                    guard toolCallsByIndex.count == 1,
+                          let partial = toolCallsByIndex.values.first,
+                          !partial.name.isEmpty,
+                          let data = partial.arguments.data(using: .utf8),
+                          (try? JSONSerialization.jsonObject(with: data)) != nil else {
+                        return false
                     }
+                    return true
+                }()
+                if hasOneCompleteToolCall {
+                    finishReason = finishReason ?? "tool_arguments_complete"
+                    print("[TOOL SPEEDUP] provider=Groq tool_arguments_complete=true")
+                    break
+                }
+
+                if finishReason == "tool_calls", !toolCallsByIndex.isEmpty {
+                    break
                 }
             }
 
@@ -867,7 +890,9 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                             onFirstToken?()
                         }
                         accumulatedText += textDelta
-                        onTextDelta?(textDelta)
+                        if collectedToolCalls.isEmpty {
+                            onTextDelta?(textDelta)
+                        }
                     }
 
                     if let fnCall = part["functionCall"] as? [String: Any],
@@ -895,6 +920,11 @@ nonisolated public final class GeminiClient: LLMClient, Sendable {
                             )
                         )
                     }
+                }
+
+                if !collectedToolCalls.isEmpty {
+                    finishReason = finishReason ?? "STOP"
+                    break
                 }
             }
 

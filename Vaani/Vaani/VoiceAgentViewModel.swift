@@ -1,5 +1,43 @@
 import Foundation
 import Observation
+#if canImport(UIKit)
+import UIKit
+#endif
+
+/// Single turn latency row for evaluation table and CSV export.
+public struct TurnLatencyRecord: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let turnText: String
+    public let mode: String
+    public let sttMs: Int
+    public let llmFirstTokenMs: Int
+    public let llmTotalMs: Int
+    public let ttsFirstAudioMs: Int
+    public let responseFirstAudioMs: Int
+    public let fullDoneMs: Int
+
+    public init(
+        id: UUID = UUID(),
+        turnText: String,
+        mode: String,
+        sttMs: Int,
+        llmFirstTokenMs: Int,
+        llmTotalMs: Int,
+        ttsFirstAudioMs: Int,
+        responseFirstAudioMs: Int,
+        fullDoneMs: Int
+    ) {
+        self.id = id
+        self.turnText = turnText
+        self.mode = mode
+        self.sttMs = sttMs
+        self.llmFirstTokenMs = llmFirstTokenMs
+        self.llmTotalMs = llmTotalMs
+        self.ttsFirstAudioMs = ttsFirstAudioMs
+        self.responseFirstAudioMs = responseFirstAudioMs
+        self.fullDoneMs = fullDoneMs
+    }
+}
 
 /// Metrics tracking execution latency across agent pipeline stages.
 public struct LatencyMetrics: Equatable, Sendable {
@@ -12,7 +50,7 @@ public struct LatencyMetrics: Equatable, Sendable {
     public var llmMs: Double
     /// Time until TTS audio begins (time-to-first-audio).
     public var ttsMs: Double
-    /// Explicit time-to-first-audio in ms (first scheduled buffer or `didStart` delegate callback).
+    /// Explicit time-to-first-audio in ms, measured on actual playback start.
     public var ttsFirstAudioMs: Double
     /// Total TTS synthesis time in ms (for neural TTS engines like Kokoro).
     public var ttsSynthMs: Double
@@ -20,7 +58,10 @@ public struct LatencyMetrics: Equatable, Sendable {
     public var ttsRTF: Double
     /// Total TTS playback duration in ms (until audio finishes playing).
     public var ttsTotalDurationMs: Double
+    /// End-to-end response time in ms: from end of user speech (VAD auto-stop or tap-stop) to first audio out.
     public var totalMs: Double
+    /// End-to-end time in ms: from end of user speech to the end of reply playback.
+    public var fullReplyDoneMs: Double
     
     public init(
         sttMs: Double = 0,
@@ -32,7 +73,8 @@ public struct LatencyMetrics: Equatable, Sendable {
         ttsSynthMs: Double = 0,
         ttsRTF: Double = 0,
         ttsTotalDurationMs: Double = 0,
-        totalMs: Double = 0
+        totalMs: Double = 0,
+        fullReplyDoneMs: Double = 0
     ) {
         self.sttMs = sttMs
         self.llmFirstTokenMs = llmFirstTokenMs
@@ -45,6 +87,7 @@ public struct LatencyMetrics: Equatable, Sendable {
         self.ttsRTF = ttsRTF
         self.ttsTotalDurationMs = ttsTotalDurationMs
         self.totalMs = totalMs
+        self.fullReplyDoneMs = fullReplyDoneMs
     }
 }
 
@@ -139,8 +182,8 @@ public final class VoiceAgentViewModel {
         }
     }
     
-    /// Selected Kokoro speech speed (`0.8 ... 1.3`, defaults to `1.0`).
-    public var kokoroSpeed: Float = 1.0 {
+    /// Selected Kokoro speech speed (`0.8 ... 1.3`, defaults to `1.1`).
+    public var kokoroSpeed: Float = 1.1 {
         didSet {
             kokoroTTS.speed = kokoroSpeed
         }
@@ -153,7 +196,7 @@ public final class VoiceAgentViewModel {
         }
     }
     
-    /// Latency breakdown metrics for STT, LLM, TTS (time-to-first-audio), and total pipeline duration.
+    /// Latency breakdown metrics for STT, LLM, TTS (time-to-first-audio), and end-to-end response time (`totalMs`).
     public var latency: LatencyMetrics = LatencyMetrics()
     
     /// Convenience accessor for time-to-first-audio in ms.
@@ -175,7 +218,7 @@ public final class VoiceAgentViewModel {
     /// Name of the LLM provider + model that answered the most recent turn (e.g. `"Groq • openai/gpt-oss-120b"`).
     public var lastAnsweringProvider: String?
 
-    /// Phase 6 hook: invoked on `@MainActor` as each complete sentence is streamed from the LLM.
+    /// Phase 6 hook: invoked on `@MainActor` as each complete sentence/clause is streamed from the LLM.
     public var onSentenceStreamed: ((String) -> Void)?
 
     /// Download/load lifecycle for the on-device WhisperKit model.
@@ -206,6 +249,15 @@ public final class VoiceAgentViewModel {
 
     /// Dev-only counter of K2 lexicon/loanword misses (`[K2 MISS]`).
     public var k2MissCount: Int = HinglishTransliterator.k2MissCount
+
+    /// In-memory per-turn latency evaluation records for CSV export.
+    public var turnResults: [TurnLatencyRecord] = []
+
+    /// Status message shown in the Dev section after copying results CSV.
+    public var csvCopyStatus: String?
+
+    /// Whether the app is currently running the Dev "Offline echo test" (STT + TTS on-device with no LLM/network).
+    public var isOfflineEchoActive: Bool = false
     
     // MARK: - Dependencies & Private State
     
@@ -221,6 +273,8 @@ public final class VoiceAgentViewModel {
     public private(set) var lastAudioSamples: [Float] = []
     
     private var activeTask: Task<Void, Never>?
+    private var currentTurnEndOfSpeechInstant: ContinuousClock.Instant?
+    private var hasRecordedFirstAudioForTurn: Bool = false
     
     // MARK: - Initialization
     
@@ -244,6 +298,11 @@ public final class VoiceAgentViewModel {
             self?.audioLevel = level
         }
 
+        // Link energy-based VAD auto-stop callback
+        audioRecorder.onVADAutoStop = { [weak self] event in
+            self?.handleVADAutoStop(event)
+        }
+
         kokoroTTS.hinglishStrategy = kokoroStrategy
         kokoroTTS.hindiSpeakerID = kokoroHindiSpeakerID
         kokoroTTS.englishSpeakerID = kokoroEnglishSpeakerID
@@ -252,7 +311,11 @@ public final class VoiceAgentViewModel {
             guard let self else { return }
             self.latency.ttsFirstAudioMs = firstAudioMs
             self.latency.ttsMs = firstAudioMs
-            self.latency.totalMs = self.latency.sttMs + self.latency.llmMs + firstAudioMs
+        }
+        kokoroTTS.onPlaybackStarted = { [weak self] playbackStartedAt in
+            Task { @MainActor [weak self] in
+                self?.recordActualPlaybackStart(playbackStartedAt)
+            }
         }
 
         appleTTS.hinglishStrategy = ttsStrategy
@@ -260,7 +323,11 @@ public final class VoiceAgentViewModel {
             guard let self else { return }
             self.latency.ttsFirstAudioMs = firstAudioMs
             self.latency.ttsMs = firstAudioMs
-            self.latency.totalMs = self.latency.sttMs + self.latency.llmMs + firstAudioMs
+        }
+        appleTTS.onPlaybackStarted = { [weak self] playbackStartedAt in
+            Task { @MainActor [weak self] in
+                self?.recordActualPlaybackStart(playbackStartedAt)
+            }
         }
 
         if !(sttClient is WhisperKitSTT) {
@@ -278,6 +345,7 @@ public final class VoiceAgentViewModel {
 
     /// Checks whether `Secrets.groqKey` or `Secrets.geminiKey` is empty and surfaces a clear in-UI banner if so.
     public func validateAPIKeysForBanner() {
+        guard !isOfflineEchoActive else { return }
         let groqEmpty = Secrets.groqKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let geminiEmpty = Secrets.geminiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if groqEmpty && geminiEmpty {
@@ -339,7 +407,7 @@ public final class VoiceAgentViewModel {
         }
     }
     
-    // MARK: - Voice & Dev Text Pipeline Controls
+    // MARK: - Voice, VAD, Offline Echo & Dev Text Pipeline Controls
     
     /// Toggles listening state on/off.
     public func toggleListening() {
@@ -347,6 +415,7 @@ public final class VoiceAgentViewModel {
         if state == .listening {
             stopListening()
         } else if state == .idle {
+            isOfflineEchoActive = false
             startListening()
         } else {
             // Cancel current ongoing operation and return to idle
@@ -362,7 +431,9 @@ public final class VoiceAgentViewModel {
         ttsClient.stop()
         errorMessage = nil
         lastScheduledAlarmNote = nil
-        validateAPIKeysForBanner()
+        if !isOfflineEchoActive {
+            validateAPIKeysForBanner()
+        }
         state = .listening
         
         activeTask = Task {
@@ -372,54 +443,135 @@ public final class VoiceAgentViewModel {
                 // Cancelled due to rapid stop or reset - do not show error banner
             } catch {
                 self.errorMessage = error.localizedDescription
+                self.isOfflineEchoActive = false
                 self.state = .idle
             }
         }
     }
     
-    /// Stops recording and runs the voice agent pipeline (STT -> LLM -> TTS).
+    /// Stops recording manually and runs the active pipeline (normal voice turn or offline echo test).
     public func stopListening() {
         guard state == .listening else { return }
         
+        let stopInstant = ContinuousClock.now
         let samples = audioRecorder.stop()
         self.lastAudioSamples = samples
         self.audioLevel = 0.0
         
+        completeListeningAndProcess(samples: samples, endOfSpeechInstant: stopInstant)
+    }
+
+    /// Invoked on `@MainActor` when `AudioRecorder`'s energy-based VAD stops recording automatically.
+    private func handleVADAutoStop(_ event: VADStopEvent) {
+        guard state == .listening else { return }
+
+        // The VAD callback marks the stop point; retrieve the accumulated 16 kHz samples
+        // and tear down the mic engine before beginning STT.
+        let samples = audioRecorder.stop()
+        self.lastAudioSamples = samples
+        self.audioLevel = 0.0
+
+        // 6s no-speech timeout -> stop and show "Didn't catch that"
+        if event.trigger == .timeout && !event.speechDetected {
+            activeTask?.cancel()
+            isOfflineEchoActive = false
+            state = .idle
+            errorMessage = "Didn't catch that"
+            return
+        }
+
+        // Measure pipeline response time from the moment VAD auto-stop fires (end of speech detection)
+        completeListeningAndProcess(samples: samples, endOfSpeechInstant: event.endOfSpeechInstant)
+    }
+
+    private func completeListeningAndProcess(
+        samples: [Float],
+        endOfSpeechInstant: ContinuousClock.Instant
+    ) {
         activeTask?.cancel()
+        currentTurnEndOfSpeechInstant = endOfSpeechInstant
+        hasRecordedFirstAudioForTurn = false
+
+        if isOfflineEchoActive {
+            activeTask = Task {
+                await executeOfflineEchoPipeline(samples: samples, endOfSpeechInstant: endOfSpeechInstant)
+            }
+            return
+        }
+
         activeTask = Task {
             latency = LatencyMetrics()
-            
+
             // 1. Transcribe audio
             let transcribedText = await transcribe(samples: samples)
             guard !Task.isCancelled else { return }
-            guard !transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let trimmedTranscript = transcribedText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedTranscript.isEmpty else {
+                errorMessage = "Didn't catch that"
                 state = .idle
                 return
             }
-            
-            // 2. Query LLM via AgentOrchestrator with the current language toggle (streams deltas to self.response)
-            let generatedAnswer = await ask(prompt: transcribedText)
-            guard !Task.isCancelled else { return }
-            guard !generatedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                state = .idle
-                return
-            }
-            
-            // 3. Speak full reply (updates latency.ttsMs on first scheduled buffer / didStart and returns to .idle on completion)
-            await speak(text: generatedAnswer)
-            guard !Task.isCancelled else { return }
-            
-            // Total latency reflects time until audio begins (STT + LLM + TTS first-audio)
-            latency.totalMs = latency.sttMs + latency.llmMs + latency.ttsMs
+
+            // 2. Stream LLM + Sentence/Clause Streaming TTS
+            await executeStreamingAgentTurn(
+                prompt: trimmedTranscript,
+                endOfSpeechInstant: endOfSpeechInstant
+            )
         }
     }
 
-    /// Sends a typed text prompt directly through the agent loop (LLM -> TTS) without voice input (used by `kDevTools`).
+    /// Starts or stops the Dev "Offline echo test": records with VAD auto-stop, transcribes with Whisper on-device,
+    /// and speaks the transcript back with the locked TTS for the selected language (no LLM or network call).
+    public func startOfflineEchoTest() {
+        guard isSTTReady else {
+            errorMessage = "Whisper STT is still loading."
+            return
+        }
+        if isOfflineEchoActive && state == .listening {
+            stopListening()
+            return
+        }
+        isOfflineEchoActive = true
+        response = ""
+        transcript = ""
+        startListening()
+    }
+
+    private func executeOfflineEchoPipeline(
+        samples: [Float],
+        endOfSpeechInstant: ContinuousClock.Instant
+    ) async {
+        defer {
+            if !Task.isCancelled {
+                isOfflineEchoActive = false
+            }
+        }
+
+        latency = LatencyMetrics()
+        let transcribedText = await transcribe(samples: samples)
+        guard !Task.isCancelled else { return }
+        let trimmed = transcribedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            errorMessage = "Didn't catch that"
+            state = .idle
+            return
+        }
+
+        self.response = trimmed
+        self.lastAnsweringProvider = "Offline Echo (Whisper + On-Device TTS)"
+        await speak(text: trimmed)
+        guard !Task.isCancelled else { return }
+
+        recordTurnLatency(turnText: "[Offline] \(trimmed)")
+    }
+
+    /// Sends a typed text prompt directly through the agent loop (LLM -> Streaming TTS) without voice input (used by `kDevTools`).
     public func sendTextPrompt(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         activeTask?.cancel()
+        isOfflineEchoActive = false
         _ = audioRecorder.stop()
         kokoroTTS.stop()
         appleTTS.stop()
@@ -430,21 +582,302 @@ public final class VoiceAgentViewModel {
         validateAPIKeysForBanner()
         transcript = trimmed
 
+        let promptStartInstant = ContinuousClock.now
+        currentTurnEndOfSpeechInstant = promptStartInstant
+        hasRecordedFirstAudioForTurn = false
+
         activeTask = Task {
             latency = LatencyMetrics(sttMs: 0)
+            await executeStreamingAgentTurn(
+                prompt: trimmed,
+                endOfSpeechInstant: promptStartInstant
+            )
+        }
+    }
 
-            let generatedAnswer = await ask(prompt: trimmed)
+    /// Executes `AgentOrchestrator.runTurn` while streaming sentence/clause chunks (`>= 4` words) directly into the active TTS engine's
+    /// playback queue (`AVAudioPlayerNode` for Kokoro, `AVSpeechSynthesizer` for Apple Isha) so audio starts while the LLM is still streaming.
+    private func executeStreamingAgentTurn(
+        prompt: String,
+        endOfSpeechInstant: ContinuousClock.Instant
+    ) async {
+        state = .thinking
+        self.response = ""
+        self.errorMessage = nil
+        self.lastScheduledAlarmNote = nil
+        validateAPIKeysForBanner()
+
+        let llmStartInstant = ContinuousClock.now
+        var llmFirstTokenInstant: ContinuousClock.Instant?
+        var streamedChunkCount = 0
+
+        let kokoroFailed: Bool
+        if case .failed = kokoroLoadingState {
+            kokoroFailed = true
+        } else {
+            kokoroFailed = false
+        }
+        let useKokoro: Bool
+        if devTTSOverrideEnabled {
+            useKokoro = (ttsEngine == .kokoro) && !kokoroFailed
+        } else {
+            useKokoro = (language == .hinglish) && !kokoroFailed
+        }
+        let supportsStreamingQueue = useKokoro || (ttsClient is KokoroTTS) || (ttsClient is AppleTTS)
+
+        // Serial async task chain so chunk N+1 is synthesized/queued in strict order right after chunk N is scheduled
+        var serialTTSChain: Task<Void, Never>?
+
+        let enqueueChunkForStreamingTTS: @MainActor (String) -> Void = { [weak self] rawChunk in
+            guard let self else { return }
+            let trimmedChunk = rawChunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedChunk.isEmpty else { return }
+
+            streamedChunkCount += 1
+            let chunkIndex = streamedChunkCount
+            let isFirstChunk = (chunkIndex == 1)
+            let refInstant = llmFirstTokenInstant ?? llmStartInstant
+            let readyMs = max(0, (ContinuousClock.now - refInstant).milliseconds)
+            let previousTask = serialTTSChain
+
+            serialTTSChain = Task { @MainActor [weak self] in
+                if let previousTask {
+                    await previousTask.value
+                }
+                guard let self, !Task.isCancelled else { return }
+                await self.synthesizeAndQueueStreamingChunk(
+                    chunk: trimmedChunk,
+                    chunkIndex: chunkIndex,
+                    isFirstChunk: isFirstChunk,
+                    readyMs: readyMs,
+                    useKokoro: useKokoro,
+                    endOfSpeechInstant: endOfSpeechInstant
+                )
+            }
+        }
+
+        do {
+            let turnResult = try await orchestrator.runTurn(
+                userText: prompt,
+                language: language,
+                onFirstToken: { [weak self] ttftMs in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        if llmFirstTokenInstant == nil {
+                            llmFirstTokenInstant = ContinuousClock.now
+                        }
+                        self.latency.llmFirstTokenMs = ttftMs
+                    }
+                },
+                onTextDelta: { [weak self] delta in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        if llmFirstTokenInstant == nil {
+                            llmFirstTokenInstant = ContinuousClock.now
+                        }
+                        self.response += delta
+                    }
+                },
+                onSentenceReady: { [weak self] chunk in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.onSentenceStreamed?(chunk)
+                        if supportsStreamingQueue {
+                            enqueueChunkForStreamingTTS(chunk)
+                        }
+                    }
+                }
+            )
+
+            // Allow any pending @MainActor tasks from onFirstToken/onTextDelta/onSentenceReady to drain before checking streamedChunkCount
+            await Task.yield()
             guard !Task.isCancelled else { return }
-            guard !generatedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+
+            latency.llmFirstTokenMs = turnResult.firstTokenMs
+            latency.llmTotalMs = turnResult.totalMs
+            latency.llmMs = turnResult.totalMs
+            lastAnsweringProvider = "\(turnResult.providerName) • \(turnResult.modelName)"
+            self.response = turnResult.reply
+
+            if turnResult.executedToolCalls.contains(where: { $0.name == "set_alarm" }) {
+                refreshAlarms()
+                for (index, toolCall) in turnResult.executedToolCalls.enumerated() where toolCall.name == "set_alarm" {
+                    if index < turnResult.executedToolOutputs.count,
+                       let note = Self.extractAlarmConfirmationNote(from: turnResult.executedToolOutputs[index]) {
+                        self.lastScheduledAlarmNote = note
+                    }
+                }
+            }
+
+            let finalReply = turnResult.reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !finalReply.isEmpty else {
                 state = .idle
                 return
             }
 
-            await speak(text: generatedAnswer)
-            guard !Task.isCancelled else { return }
+            if supportsStreamingQueue {
+                if streamedChunkCount == 0 {
+                    // Fallback if reply was synthesized deterministically after tool execution without streamed deltas
+                    for chunk in SentenceStreamBuffer.splitText(finalReply, language: language) {
+                        enqueueChunkForStreamingTTS(chunk)
+                    }
+                }
+                if let serialTTSChain {
+                    await serialTTSChain.value
+                }
+                guard !Task.isCancelled else { return }
+                await finalizeStreamingTurnPlayback(useKokoro: useKokoro)
+            } else {
+                await speak(text: finalReply)
+            }
 
-            latency.totalMs = latency.sttMs + latency.llmMs + latency.ttsMs
+            guard !Task.isCancelled else { return }
+            recordTurnLatency(turnText: prompt)
+            state = .idle
+        } catch is CancellationError {
+            return
+        } catch {
+            print("LLM query error: \(error)")
+            let elapsed = (ContinuousClock.now - llmStartInstant).milliseconds
+            latency.llmTotalMs = elapsed
+            latency.llmMs = elapsed
+            errorMessage = error.localizedDescription
+            state = .idle
         }
+    }
+
+    private func synthesizeAndQueueStreamingChunk(
+        chunk: String,
+        chunkIndex: Int,
+        isFirstChunk: Bool,
+        readyMs: Double,
+        useKokoro: Bool,
+        endOfSpeechInstant: ContinuousClock.Instant
+    ) async {
+        if state != .speaking {
+            state = .speaking
+        }
+
+        do {
+            if useKokoro {
+                let activeStrategy: KokoroStrategy = devTTSOverrideEnabled ? kokoroStrategy : .k2DevanagariMixHi
+                let activeSpeakerID: Int
+                if devTTSOverrideEnabled {
+                    activeSpeakerID = (language == .english) ? kokoroEnglishSpeakerID : kokoroHindiSpeakerID
+                } else {
+                    activeSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
+                }
+
+                kokoroTTS.hinglishStrategy = activeStrategy
+                kokoroTTS.hindiSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
+                kokoroTTS.speed = kokoroSpeed
+
+                let result = try await kokoroTTS.enqueueStreamingChunk(
+                    text: chunk,
+                    language: language,
+                    isFirstChunk: isFirstChunk,
+                    strategyOverride: (language == .hinglish || devTTSOverrideEnabled) ? activeStrategy : nil,
+                    speakerIDOverride: activeSpeakerID,
+                    speedOverride: kokoroSpeed
+                )
+                print("[PIPE] chunk=\(chunkIndex) chars=\(chunk.count) synth_ms=\(Int(result.synthMs.rounded())) firstAudio_ms=\(Int(result.firstAudioMs.rounded())) text=\(chunk.debugDescription) ready_ms=\(Int(readyMs.rounded()))")
+            } else {
+                appleTTS.hinglishStrategy = ttsStrategy
+                let chunkFirstAudioMs = try await appleTTS.enqueueStreamingChunk(
+                    text: chunk,
+                    language: language,
+                    isFirstChunk: isFirstChunk,
+                    strategyOverride: language == .hinglish ? ttsStrategy : nil,
+                    voiceIdentifierOverride: language == .english ? AppleTTS.ishaVoiceInfo.id : nil
+                )
+                print("[PIPE] chunk=\(chunkIndex) chars=\(chunk.count) synth_ms=0 firstAudio_ms=\(Int(chunkFirstAudioMs.rounded())) text=\(chunk.debugDescription) ready_ms=\(Int(readyMs.rounded()))")
+            }
+        } catch is CancellationError {
+            // Cancelled cleanly
+        } catch {
+            print("Streaming TTS chunk error: \(error)")
+        }
+    }
+
+    private func finalizeStreamingTurnPlayback(useKokoro: Bool) async {
+        if useKokoro {
+            if let metrics = await kokoroTTS.finishStreamingTurn() {
+                latency.ttsFirstAudioMs = metrics.firstAudioMs
+                latency.ttsMs = metrics.firstAudioMs
+                latency.ttsSynthMs = metrics.synthMs
+                latency.ttsRTF = metrics.rtf
+                latency.ttsTotalDurationMs = metrics.totalDurationMs
+            }
+        } else {
+            if let metrics = await appleTTS.finishStreamingTurn() {
+                latency.ttsFirstAudioMs = metrics.firstAudioMs
+                latency.ttsMs = metrics.firstAudioMs
+                latency.ttsSynthMs = 0.0
+                latency.ttsRTF = 0.0
+                latency.ttsTotalDurationMs = metrics.totalDurationMs
+            }
+        }
+        markFullReplyDone()
+        k2MissCount = HinglishTransliterator.k2MissCount
+    }
+
+    /// Records the actual hardware playback start captured by AVSpeechSynthesizer's `didStart`
+    /// or Kokoro's AVAudioEngine mixer render tap.
+    private func recordActualPlaybackStart(_ playbackStartedAt: ContinuousClock.Instant) {
+        guard !hasRecordedFirstAudioForTurn else { return }
+        hasRecordedFirstAudioForTurn = true
+        if let endOfSpeech = currentTurnEndOfSpeechInstant {
+            latency.totalMs = (playbackStartedAt - endOfSpeech).milliseconds
+        }
+    }
+
+    /// Records the true end of the final queued audio buffer, separately from first audio.
+    private func markFullReplyDone() {
+        guard let endOfSpeech = currentTurnEndOfSpeechInstant else { return }
+        latency.fullReplyDoneMs = (ContinuousClock.now - endOfSpeech).milliseconds
+    }
+
+    private func recordTurnLatency(turnText: String) {
+        let sttVal = Int(latency.sttMs.rounded())
+        let llm1stVal = Int(latency.llmFirstTokenMs.rounded())
+        let llmTotalVal = Int(latency.llmTotalMs.rounded())
+        let tts1stVal = Int(latency.ttsFirstAudioMs.rounded())
+        let responseVal = Int(latency.totalMs.rounded())
+        let fullDoneVal = Int(latency.fullReplyDoneMs.rounded())
+        let modeVal = language.rawValue
+
+        print("[LATENCY] stt=\(sttVal) llm1st=\(llm1stVal) llmTotal=\(llmTotalVal) tts1st=\(tts1stVal) response_first_audio=\(responseVal) full_done=\(fullDoneVal) mode=\(modeVal)")
+
+        let record = TurnLatencyRecord(
+            turnText: turnText,
+            mode: modeVal,
+            sttMs: sttVal,
+            llmFirstTokenMs: llm1stVal,
+            llmTotalMs: llmTotalVal,
+            ttsFirstAudioMs: tts1stVal,
+            responseFirstAudioMs: responseVal,
+            fullDoneMs: fullDoneVal
+        )
+        turnResults.append(record)
+    }
+
+    /// Formats all recorded turns as CSV and copies them to the system clipboard for the evaluation table.
+    @discardableResult
+    public func copyResultsCSV() -> String {
+        var lines: [String] = [
+            "turn_text,mode,stt,llm1st,llmTotal,tts1st,response_first_audio,full_done"
+        ]
+        for row in turnResults {
+            let escapedText = row.turnText.replacingOccurrences(of: "\"", with: "\"\"")
+            lines.append("\"\(escapedText)\",\(row.mode),\(row.sttMs),\(row.llmFirstTokenMs),\(row.llmTotalMs),\(row.ttsFirstAudioMs),\(row.responseFirstAudioMs),\(row.fullDoneMs)")
+        }
+        let csv = lines.joined(separator: "\n")
+        #if canImport(UIKit)
+        UIPasteboard.general.string = csv
+        #endif
+        csvCopyStatus = "Copied \(turnResults.count) turn(s) to clipboard"
+        print("[LATENCY CSV]\n\(csv)")
+        return csv
     }
 
     /// Human-readable description of the active TTS engine and voice for the Dev section.
@@ -473,6 +906,7 @@ public final class VoiceAgentViewModel {
         devTTSOverrideEnabled = false
         kokoroHindiSpeakerID = KokoroSpeaker.defaultHindiSpeakerID
         kokoroStrategy = .k2DevanagariMixHi
+        kokoroSpeed = 1.1
         ttsStrategy = .romanizedHiIN
         ttsEngine = (language == .hinglish) ? .kokoro : .apple
     }
@@ -553,12 +987,15 @@ public final class VoiceAgentViewModel {
         guard let data = jsonString.data(using: .utf8),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let status = dict["status"] as? String,
-              status == "success" else {
+              (status == "success" || status == "already_exists") else {
             return nil
         }
         let timeText = (dict["time_spoken"] as? String)
             ?? (dict["time_iso"] as? String)
             ?? "scheduled time"
+        if status == "already_exists" {
+            return "Alarm already set for \(timeText) (shows on lock screen when it rings; AlarmKit alarms are not listed in the Clock app)"
+        }
         return "Alarm set for \(timeText) (shows on lock screen when it rings; AlarmKit alarms are not listed in the Clock app)"
     }
     
@@ -566,6 +1003,7 @@ public final class VoiceAgentViewModel {
     public func reset() {
         activeTask?.cancel()
         activeTask = nil
+        isOfflineEchoActive = false
         _ = audioRecorder.stop()
         kokoroTTS.stop()
         appleTTS.stop()
@@ -634,7 +1072,6 @@ public final class VoiceAgentViewModel {
                     }
                 },
                 onSentenceReady: { [weak self] sentence in
-                    // Phase 6 hook for sentence-level TTS streaming
                     Task { @MainActor [weak self] in
                         self?.onSentenceStreamed?(sentence)
                     }
@@ -724,7 +1161,6 @@ public final class VoiceAgentViewModel {
                 latency.ttsSynthMs = metrics.synthMs
                 latency.ttsRTF = metrics.rtf
                 latency.ttsTotalDurationMs = metrics.totalDurationMs
-                latency.totalMs = latency.sttMs + latency.llmMs + metrics.firstAudioMs
             } else if (ttsClient is KokoroTTS) || (ttsClient is AppleTTS) {
                 // English mode (Isha Premium en-IN) or automatic AppleTTS fallback if Kokoro is not ready in Hinglish mode
                 latency.ttsSynthMs = 0.0
@@ -741,7 +1177,6 @@ public final class VoiceAgentViewModel {
                 latency.ttsSynthMs = 0.0
                 latency.ttsRTF = 0.0
                 latency.ttsTotalDurationMs = metrics.totalDurationMs
-                latency.totalMs = latency.sttMs + latency.llmMs + metrics.firstAudioMs
             } else {
                 latency.ttsSynthMs = 0.0
                 latency.ttsRTF = 0.0
@@ -750,7 +1185,6 @@ public final class VoiceAgentViewModel {
                 latency.ttsFirstAudioMs = elapsed
                 latency.ttsMs = elapsed
                 latency.ttsTotalDurationMs = elapsed
-                latency.totalMs = latency.sttMs + latency.llmMs + elapsed
             }
         } catch is CancellationError {
             // Cancelled cleanly
@@ -760,6 +1194,10 @@ public final class VoiceAgentViewModel {
         }
         
         k2MissCount = HinglishTransliterator.k2MissCount
+
+        if !Task.isCancelled {
+            markFullReplyDone()
+        }
 
         if !Task.isCancelled {
             state = .idle

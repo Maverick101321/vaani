@@ -82,6 +82,7 @@ nonisolated public final class WhisperKitSTT: SpeechToText, Sendable {
 
 private actor WhisperKitStore {
     private var whisperKit: WhisperKit?
+    private var cachedHinglishPromptTokens: [Int]?
     private var isPreparing = false
 
     func prepare(config: STTConfig, stateHandler: @escaping @MainActor @Sendable (STTLoadingState) -> Void) async throws {
@@ -107,6 +108,9 @@ private actor WhisperKitStore {
             await stateHandler(.loading)
             try await kit.prewarmModels()
             try await kit.loadModels()
+            if let tokenizer = kit.tokenizer {
+                cachedHinglishPromptTokens = tokenizer.encode(text: Self.hinglishPrompt)
+            }
             whisperKit = kit
             await stateHandler(.ready)
         } catch {
@@ -123,33 +127,71 @@ private actor WhisperKitStore {
 
         let promptTokens: [Int]?
         if languageMode == .hinglish && config.useHinglishPrompt {
-            guard let tokenizer = whisperKit.tokenizer else { throw WhisperKitSTTError.tokenizerUnavailable }
-            promptTokens = tokenizer.encode(text: Self.hinglishPrompt)
+            if let cached = cachedHinglishPromptTokens {
+                promptTokens = cached
+            } else {
+                guard let tokenizer = whisperKit.tokenizer else { throw WhisperKitSTTError.tokenizerUnavailable }
+                let encoded = tokenizer.encode(text: Self.hinglishPrompt)
+                cachedHinglishPromptTokens = encoded
+                promptTokens = encoded
+            }
         } else {
             promptTokens = nil
         }
 
-        // A zero fallback count prevents a fallback to non-greedy temperatures.
         let options = DecodingOptions(
             language: languageMode.whisperLanguageCode,
             temperature: 0,
             temperatureFallbackCount: 0,
+            sampleLength: 128,
             skipSpecialTokens: true,
             withoutTimestamps: true,
             promptTokens: promptTokens
         )
 
         let start = ContinuousClock.now
-        let results = try await whisperKit.transcribe(audioArray: trimmedSamples, decodeOptions: options)
-        let rawText = results.map(\.text).joined(separator: " ")
+        var results = try await whisperKit.transcribe(audioArray: trimmedSamples, decodeOptions: options)
+        var rawText = results.map(\.text).joined(separator: " ")
+        var containsDevanagari = Self.containsDevanagariScalars(rawText)
+
+        if languageMode == .hinglish && containsDevanagari {
+            print("[STT GUARD] devanagari detected, re-decoding")
+            let retryPromptTokens: [Int]?
+            if let promptTokens {
+                retryPromptTokens = promptTokens
+            } else if let tokenizer = whisperKit.tokenizer {
+                let encoded = tokenizer.encode(text: Self.hinglishPrompt)
+                cachedHinglishPromptTokens = encoded
+                retryPromptTokens = encoded
+            } else {
+                retryPromptTokens = nil
+            }
+            let retryOptions = DecodingOptions(
+                language: languageMode.whisperLanguageCode,
+                temperature: 0,
+                temperatureFallbackCount: 0,
+                sampleLength: 128,
+                usePrefillPrompt: true,
+                skipSpecialTokens: true,
+                withoutTimestamps: true,
+                promptTokens: retryPromptTokens
+            )
+            results = try await whisperKit.transcribe(audioArray: trimmedSamples, decodeOptions: retryOptions)
+            rawText = results.map(\.text).joined(separator: " ")
+            containsDevanagari = Self.containsDevanagariScalars(rawText)
+        }
+
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         let elapsed = ContinuousClock.now - start
-        let containsDevanagari = rawText.unicodeScalars.contains { (0x0900...0x097F).contains($0.value) }
         let sttMilliseconds = String(format: "%.0f", elapsed.milliseconds)
 
-        // DEBUG: one compact diagnostic per transcription for the Xcode console.
+        print("[STT] lang=\(languageMode.whisperLanguageCode) decode_ms=\(sttMilliseconds) prompt_tokens=\(promptTokens?.count ?? 0)")
         print("[WhisperKitSTT DEBUG] model=\(config.modelName) languageMode=\(languageMode.rawValue) rawText=\(rawText.debugDescription) containsDevanagari=\(containsDevanagari) sttMs=\(sttMilliseconds)")
         return text
+    }
+
+    private static func containsDevanagariScalars(_ text: String) -> Bool {
+        text.unicodeScalars.contains { (0x0900...0x097F).contains($0.value) }
     }
 
     /// Removes quiet leading/trailing samples while retaining 100 ms of speech context.
@@ -165,6 +207,7 @@ private actor WhisperKitStore {
         return Array(samples[start..<end])
     }
 
+    /// 24-word Roman-script Hinglish prompt to steer Whisper `hi` transcription into Roman script instead of Devanagari.
     private static let hinglishPrompt = "Aaj ka schedule kya hai, aur meri next meeting kab hai? Mujhe kal subah 7 baje ka alarm set karna hai."
 }
 

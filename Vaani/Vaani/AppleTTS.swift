@@ -938,8 +938,45 @@ nonisolated public enum HinglishTransliterator {
         return result
     }
 
+    // MARK: - K2 "set" A/B Pronunciation Option (सेट default vs सैट)
+
+    public enum SetPronunciation: String, CaseIterable, Identifiable, Sendable {
+        case set = "सेट"
+        case sait = "सैट"
+
+        public var id: String { rawValue }
+
+        public var displayLabel: String {
+            switch self {
+            case .set:
+                return "सेट (default)"
+            case .sait:
+                return "सैट (alt)"
+            }
+        }
+    }
+
+    private static var _setPronunciation: SetPronunciation = .set
+
+    /// Runtime A/B toggle for the Devanagari spelling of `"set"` in K2 (`"सेट"` default vs `"सैट"`).
+    public static var setPronunciation: SetPronunciation {
+        get {
+            missLock.lock()
+            defer { missLock.unlock() }
+            return _setPronunciation
+        }
+        set {
+            missLock.lock()
+            _setPronunciation = newValue
+            missLock.unlock()
+        }
+    }
+
     /// Looks up a single lowercased ASCII word in `commonHindiWords` with plural (`-s`, `-es`, `-ies`) tolerance.
     private static func lookupWord(_ lowercasedWord: String) -> String? {
+        if lowercasedWord == "set" {
+            return setPronunciation.rawValue
+        }
         if let direct = commonHindiWords[lowercasedWord] {
             return direct
         }
@@ -1071,6 +1108,7 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
     private var _voiceIdentifierOverride: String?
     private var _lastMetrics: TTSSynthesisMetrics?
     private var _onFirstAudio: (@MainActor @Sendable (Double) -> Void)?
+    private var _onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)?
     private var _onMetrics: (@MainActor @Sendable (TTSSynthesisMetrics) -> Void)?
 
     /// Dedicated serial queue for off-main-thread `AVAudioSession` configuration.
@@ -1128,6 +1166,12 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
         }
     }
 
+    /// Timestamp captured inside `AVSpeechSynthesizerDelegate.didStart`, when playback actually begins.
+    public var onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onPlaybackStarted }
+        set { lock.lock(); _onPlaybackStarted = newValue; lock.unlock() }
+    }
+
     /// Callback invoked on `MainActor` when an utterance finishes with both `firstAudioMs` and `totalDurationMs`.
     public var onMetrics: (@MainActor @Sendable (TTSSynthesisMetrics) -> Void)? {
         get {
@@ -1162,6 +1206,83 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
         Task { @MainActor [coordinator] in
             coordinator.stopSpeaking()
         }
+    }
+
+    // MARK: - Turn-Level Streaming Queue API (for LLM Token Streaming)
+
+    /// Queues a streamed sentence/clause chunk onto `AVSpeechSynthesizer`'s native utterance queue.
+    /// Chunk 1 stops any prior speech, configures the audio session, starts speaking immediately, and returns once `didStart` fires.
+    /// Subsequent chunks are queued onto `AVSpeechSynthesizer` while earlier chunks play with zero gaps or overlap.
+    public nonisolated func enqueueStreamingChunk(
+        text: String,
+        language: VoiceAgentViewModel.Language,
+        isFirstChunk: Bool,
+        strategyOverride: TTSStrategy? = nil,
+        voiceIdentifierOverride: String? = nil
+    ) async throws -> Double {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0 }
+
+        try Task.checkCancellation()
+
+        if isFirstChunk {
+            try await configurePlaybackAudioSession()
+            try Task.checkCancellation()
+        }
+
+        let effectiveStrategy = strategyOverride ?? self.hinglishStrategy
+        let effectiveVoiceOverride = voiceIdentifierOverride ?? self.voiceIdentifierOverride
+        let firstAudioCallback = self.onFirstAudio
+        let playbackStartedCallback = self.onPlaybackStarted
+
+        let spokenText: String
+        let strategyLabel: String
+        let languagePair: (primary: String, fallback: String)
+
+        switch language {
+        case .english:
+            if let strategyOverride {
+                strategyLabel = strategyOverride.rawValue
+                languagePair = strategyOverride.languagePreference
+                spokenText = (strategyOverride == .devanagariHiIN)
+                    ? HinglishTransliterator.transliterate(trimmed)
+                    : trimmed
+            } else {
+                strategyLabel = "englishDefault"
+                languagePair = ("en-IN", "en-US")
+                spokenText = trimmed
+            }
+        case .hinglish:
+            strategyLabel = effectiveStrategy.rawValue
+            languagePair = effectiveStrategy.languagePreference
+            spokenText = (effectiveStrategy == .devanagariHiIN)
+                ? HinglishTransliterator.transliterate(trimmed)
+                : trimmed
+        }
+
+        return await coordinator.enqueueStreamingUtterance(
+            spokenText: spokenText,
+            strategyLabel: strategyLabel,
+            primaryLanguage: languagePair.primary,
+            fallbackLanguage: languagePair.fallback,
+            voiceIdentifierOverride: effectiveVoiceOverride,
+            isFirstChunk: isFirstChunk,
+            onFirstAudio: firstAudioCallback,
+            onPlaybackStarted: playbackStartedCallback
+        )
+    }
+
+    /// Waits for all queued `AVSpeechUtterance` chunks in the current turn to finish playing and returns turn `TTSSynthesisMetrics`.
+    @discardableResult
+    public nonisolated func finishStreamingTurn() async -> TTSSynthesisMetrics? {
+        guard let metrics = await coordinator.waitForStreamingTurnCompletion() else {
+            return nil
+        }
+        storeLastMetrics(metrics)
+        if let metricsCallback = self.onMetrics {
+            await metricsCallback(metrics)
+        }
+        return metrics
     }
 
     // MARK: - Extended Synthesis API
@@ -1199,6 +1320,7 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
         let effectiveStrategy = strategyOverride ?? self.hinglishStrategy
         let effectiveVoiceOverride = voiceIdentifierOverride ?? self.voiceIdentifierOverride
         let firstAudioCallback = self.onFirstAudio
+        let playbackStartedCallback = self.onPlaybackStarted
         let metricsCallback = self.onMetrics
 
         let spokenText: String
@@ -1234,7 +1356,8 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
                 primaryLanguage: languagePair.primary,
                 fallbackLanguage: languagePair.fallback,
                 voiceIdentifierOverride: effectiveVoiceOverride,
-                onFirstAudio: firstAudioCallback
+                onFirstAudio: firstAudioCallback,
+                onPlaybackStarted: playbackStartedCallback
             )
         } onCancel: { [coordinator] in
             Task { @MainActor in
@@ -1320,14 +1443,18 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
                 #if os(iOS) || os(visionOS)
                 do {
                     let audioSession = AVAudioSession.sharedInstance()
-                    // Use .playAndRecord with .defaultToSpeaker and allowBluetooth variants so
-                    // output plays loudly through the speaker and remains compatible with mic capture.
-                    try audioSession.setCategory(
-                        .playAndRecord,
-                        mode: .default,
-                        options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
-                    )
-                    try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                    // Avoid re-running setCategory + setActive on every turn/chunk when already in .playAndRecord
+                    // with .defaultToSpeaker; redundant activation resets coreaudiod's AudioQueue IO cycle and
+                    // triggers transient "AudioQueue underflow: injecting silence" warnings during AVSpeech playback.
+                    let desiredOptions: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+                    if audioSession.category != .playAndRecord || !audioSession.categoryOptions.contains(.defaultToSpeaker) {
+                        try audioSession.setCategory(
+                            .playAndRecord,
+                            mode: .default,
+                            options: desiredOptions
+                        )
+                        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                    }
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
@@ -1344,6 +1471,9 @@ nonisolated public final class AppleTTS: TextToSpeech, @unchecked Sendable {
 
 @MainActor
 private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
+    /// Speech rate for Apple Isha (`0.52` = `AVSpeechUtteranceDefaultSpeechRate + 0.02`, tuned from `0.55`).
+    static let ishaSpeechRate: Float = 0.52
+
     private var synthesizerInstance: AVSpeechSynthesizer?
 
     private struct ActiveUtteranceContext {
@@ -1356,11 +1486,28 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
         let strategyLabel: String
         let spokenText: String
         let onFirstAudio: (@MainActor @Sendable (Double) -> Void)?
+        let onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)?
         var firstAudioMs: Double?
         let continuation: CheckedContinuation<TTSSynthesisMetrics, Error>
     }
 
     private var activeContext: ActiveUtteranceContext?
+
+    // Streaming turn state (multiple utterances queued back-to-back on AVSpeechSynthesizer)
+    private var streamingTurnStartTime: ContinuousClock.Instant?
+    private var streamingFirstAudioMs: Double?
+    private var streamingFirstChunkID: ObjectIdentifier?
+    private var streamingPendingUtteranceIDs: Set<ObjectIdentifier> = []
+    private var streamingFirstAudioContinuation: CheckedContinuation<Double, Never>?
+    private var streamingCompletionContinuations: [CheckedContinuation<Void, Never>] = []
+    private var streamingOnFirstAudio: (@MainActor @Sendable (Double) -> Void)?
+    private var streamingOnPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)?
+    private var streamingVoiceIdentifier: String = "com.apple.voice.premium.en-IN.Isha"
+    private var streamingVoiceName: String = "Isha"
+    private var streamingVoiceLanguage: String = "en-IN"
+    private var streamingVoiceQuality: String = "Premium"
+    private var streamingStrategyLabel: String = "englishDefault"
+    private var streamingTexts: [String] = []
 
     override nonisolated init() {
         super.init()
@@ -1379,18 +1526,131 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
         return synth
     }
 
+    func enqueueStreamingUtterance(
+        spokenText: String,
+        strategyLabel: String,
+        primaryLanguage: String,
+        fallbackLanguage: String,
+        voiceIdentifierOverride: String?,
+        isFirstChunk: Bool,
+        onFirstAudio: (@MainActor @Sendable (Double) -> Void)?,
+        onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)?
+    ) async -> Double {
+        let synthesizer = ensureSynthesizer()
+
+        if isFirstChunk {
+            if activeContext != nil || !streamingPendingUtteranceIDs.isEmpty || synthesizer.isSpeaking {
+                stopSpeaking()
+            }
+            streamingTurnStartTime = ContinuousClock.now
+            streamingFirstAudioMs = nil
+            streamingTexts = []
+            streamingOnFirstAudio = onFirstAudio
+            streamingOnPlaybackStarted = onPlaybackStarted
+        }
+
+        let chosenVoice = AppleTTS.selectBestAVVoice(
+            primaryLanguage: primaryLanguage,
+            fallbackLanguage: fallbackLanguage,
+            identifierOverride: voiceIdentifierOverride
+        )
+
+        let utterance = AVSpeechUtterance(string: spokenText)
+        utterance.voice = chosenVoice
+        utterance.rate = Self.ishaSpeechRate
+        utterance.pitchMultiplier = 1.0
+        utterance.volume = 1.0
+        utterance.preUtteranceDelay = 0.0
+        utterance.postUtteranceDelay = 0.0
+
+        streamingVoiceIdentifier = chosenVoice?.identifier ?? "system-default"
+        streamingVoiceName = chosenVoice?.name ?? "System Default"
+        streamingVoiceLanguage = chosenVoice?.language ?? primaryLanguage
+        streamingVoiceQuality = chosenVoice.map { TTSVoiceInfo.QualityTier(avQuality: $0.quality).label } ?? "Default"
+        streamingStrategyLabel = strategyLabel
+        streamingTexts.append(spokenText)
+
+        let utteranceID = ObjectIdentifier(utterance)
+        streamingPendingUtteranceIDs.insert(utteranceID)
+
+        if isFirstChunk {
+            streamingFirstChunkID = utteranceID
+            return await withCheckedContinuation { (continuation: CheckedContinuation<Double, Never>) in
+                self.streamingFirstAudioContinuation = continuation
+                synthesizer.speak(utterance)
+            }
+        } else {
+            let enqueueStart = ContinuousClock.now
+            synthesizer.speak(utterance)
+            return (ContinuousClock.now - enqueueStart).milliseconds
+        }
+    }
+
+    func waitForStreamingTurnCompletion() async -> TTSSynthesisMetrics? {
+        guard let turnStart = streamingTurnStartTime else {
+            return nil
+        }
+
+        if !streamingPendingUtteranceIDs.isEmpty {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if self.streamingPendingUtteranceIDs.isEmpty {
+                    continuation.resume()
+                } else {
+                    self.streamingCompletionContinuations.append(continuation)
+                }
+            }
+        }
+
+        let totalMs = (ContinuousClock.now - turnStart).milliseconds
+        let firstAudioMs = streamingFirstAudioMs ?? totalMs
+        let fullText = streamingTexts.joined(separator: " ")
+
+        print(String(
+            format: "[TTS DEBUG] engine=Apple speaker=%@ (%@, %@) strategy=%@ rate=%.2f firstAudioMs=%.0f synthMs=%.0f playMs=%.0f rtf=0.00 text=%@",
+            streamingVoiceIdentifier,
+            streamingVoiceName,
+            streamingVoiceLanguage,
+            streamingStrategyLabel,
+            Self.ishaSpeechRate,
+            firstAudioMs,
+            firstAudioMs,
+            totalMs,
+            fullText.debugDescription
+        ))
+
+        let metrics = TTSSynthesisMetrics(
+            firstAudioMs: firstAudioMs,
+            totalDurationMs: totalMs,
+            voiceIdentifier: streamingVoiceIdentifier,
+            voiceName: streamingVoiceName,
+            voiceLanguage: streamingVoiceLanguage,
+            voiceQuality: streamingVoiceQuality,
+            strategy: streamingStrategyLabel,
+            spokenText: fullText
+        )
+
+        streamingTurnStartTime = nil
+        streamingFirstAudioMs = nil
+        streamingFirstChunkID = nil
+        streamingTexts = []
+        streamingOnFirstAudio = nil
+
+        return metrics
+    }
+
     func speak(
         spokenText: String,
         strategyLabel: String,
         primaryLanguage: String,
         fallbackLanguage: String,
         voiceIdentifierOverride: String?,
-        onFirstAudio: (@MainActor @Sendable (Double) -> Void)?
+        onFirstAudio: (@MainActor @Sendable (Double) -> Void)?,
+        onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)?
     ) async throws -> TTSSynthesisMetrics {
         let synthesizer = ensureSynthesizer()
 
         // Stop any existing speech before starting a new utterance
-        if activeContext != nil || synthesizer.isSpeaking {
+        if activeContext != nil || !streamingPendingUtteranceIDs.isEmpty || synthesizer.isSpeaking {
             stopSpeaking()
         }
 
@@ -1402,9 +1662,11 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
 
         let utterance = AVSpeechUtterance(string: spokenText)
         utterance.voice = chosenVoice
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        utterance.rate = Self.ishaSpeechRate
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
+        utterance.preUtteranceDelay = 0.0
+        utterance.postUtteranceDelay = 0.0
 
         let voiceId = chosenVoice?.identifier ?? "system-default"
         let voiceName = chosenVoice?.name ?? "System Default"
@@ -1424,6 +1686,7 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
                 strategyLabel: strategyLabel,
                 spokenText: spokenText,
                 onFirstAudio: onFirstAudio,
+                onPlaybackStarted: onPlaybackStarted,
                 firstAudioMs: nil,
                 continuation: continuation
             )
@@ -1436,6 +1699,18 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
         if let synthesizer = synthesizerInstance, (synthesizer.isSpeaking || synthesizer.isPaused) {
             synthesizer.stopSpeaking(at: .immediate)
         }
+        if let firstCont = streamingFirstAudioContinuation {
+            streamingFirstAudioContinuation = nil
+            let elapsed = streamingTurnStartTime.map { (ContinuousClock.now - $0).milliseconds } ?? 0
+            firstCont.resume(returning: elapsed)
+        }
+        streamingPendingUtteranceIDs.removeAll()
+        let completionConts = streamingCompletionContinuations
+        streamingCompletionContinuations.removeAll()
+        for cont in completionConts {
+            cont.resume()
+        }
+
         if let context = activeContext {
             activeContext = nil
             let elapsedMs = (ContinuousClock.now - context.startTime).milliseconds
@@ -1454,30 +1729,77 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    private func handleDidStart(utteranceID: ObjectIdentifier) {
+    private func handleDidStart(utteranceID: ObjectIdentifier, playbackStartedAt: ContinuousClock.Instant) {
+        if streamingPendingUtteranceIDs.contains(utteranceID) {
+            if streamingFirstAudioMs == nil, let turnStart = streamingTurnStartTime {
+                let firstMs = max(0, (playbackStartedAt - turnStart).milliseconds)
+                streamingFirstAudioMs = firstMs
+                print(String(
+                    format: "[AppleTTS DEBUG] voice=%@ (%@, %@) quality=%@ strategy=%@ rate=%.2f firstAudioMs=%.0f text=%@",
+                    streamingVoiceIdentifier,
+                    streamingVoiceName,
+                    streamingVoiceLanguage,
+                    streamingVoiceQuality,
+                    streamingStrategyLabel,
+                    Self.ishaSpeechRate,
+                    firstMs,
+                    (streamingTexts.first ?? "").debugDescription
+                ))
+                streamingOnFirstAudio?(firstMs)
+                streamingOnPlaybackStarted?(playbackStartedAt)
+                if let firstCont = streamingFirstAudioContinuation {
+                    streamingFirstAudioContinuation = nil
+                    firstCont.resume(returning: firstMs)
+                }
+            }
+            return
+        }
+
         guard var context = activeContext, context.utteranceID == utteranceID else { return }
         guard context.firstAudioMs == nil else { return }
 
-        let firstAudioMs = (ContinuousClock.now - context.startTime).milliseconds
+        let firstAudioMs = max(0, (playbackStartedAt - context.startTime).milliseconds)
         context.firstAudioMs = firstAudioMs
         activeContext = context
 
         // DEBUG: Log chosen voice identifier and quality, strategy, text actually spoken, and time-to-first-audio.
         print(String(
-            format: "[AppleTTS DEBUG] voice=%@ (%@, %@) quality=%@ strategy=%@ firstAudioMs=%.0f text=%@",
+            format: "[AppleTTS DEBUG] voice=%@ (%@, %@) quality=%@ strategy=%@ rate=%.2f firstAudioMs=%.0f text=%@",
             context.voiceIdentifier,
             context.voiceName,
             context.voiceLanguage,
             context.voiceQuality,
             context.strategyLabel,
+            Self.ishaSpeechRate,
             firstAudioMs,
             context.spokenText.debugDescription
         ))
 
         context.onFirstAudio?(firstAudioMs)
+        context.onPlaybackStarted?(playbackStartedAt)
     }
 
     private func handleDidFinishOrCancel(utteranceID: ObjectIdentifier) {
+        if streamingPendingUtteranceIDs.remove(utteranceID) != nil {
+            if streamingFirstAudioMs == nil, let turnStart = streamingTurnStartTime {
+                let firstMs = (ContinuousClock.now - turnStart).milliseconds
+                streamingFirstAudioMs = firstMs
+                streamingOnFirstAudio?(firstMs)
+                if let firstCont = streamingFirstAudioContinuation {
+                    streamingFirstAudioContinuation = nil
+                    firstCont.resume(returning: firstMs)
+                }
+            }
+            if streamingPendingUtteranceIDs.isEmpty {
+                let conts = streamingCompletionContinuations
+                streamingCompletionContinuations.removeAll()
+                for cont in conts {
+                    cont.resume()
+                }
+            }
+            return
+        }
+
         guard let context = activeContext, context.utteranceID == utteranceID else { return }
         activeContext = nil
 
@@ -1487,12 +1809,13 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
         if context.firstAudioMs == nil {
             // DEBUG: Fallback log if completion occurred before a separate didStart event.
             print(String(
-                format: "[AppleTTS DEBUG] voice=%@ (%@, %@) quality=%@ strategy=%@ firstAudioMs=%.0f text=%@",
+                format: "[AppleTTS DEBUG] voice=%@ (%@, %@) quality=%@ strategy=%@ rate=%.2f firstAudioMs=%.0f text=%@",
                 context.voiceIdentifier,
                 context.voiceName,
                 context.voiceLanguage,
                 context.voiceQuality,
                 context.strategyLabel,
+                Self.ishaSpeechRate,
                 firstAudioMs,
                 context.spokenText.debugDescription
             ))
@@ -1500,13 +1823,15 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
         }
 
         print(String(
-            format: "[TTS DEBUG] engine=Apple speaker=%@ (%@, %@) strategy=%@ firstAudioMs=%.0f synthMs=%.0f rtf=0.00 text=%@",
+            format: "[TTS DEBUG] engine=Apple speaker=%@ (%@, %@) strategy=%@ rate=%.2f firstAudioMs=%.0f synthMs=%.0f playMs=%.0f rtf=0.00 text=%@",
             context.voiceIdentifier,
             context.voiceName,
             context.voiceLanguage,
             context.strategyLabel,
+            Self.ishaSpeechRate,
             firstAudioMs,
             firstAudioMs,
+            totalMs,
             context.spokenText.debugDescription
         ))
 
@@ -1527,8 +1852,9 @@ private final class AppleTTSCoordinator: NSObject, AVSpeechSynthesizerDelegate {
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
         let utteranceID = ObjectIdentifier(utterance)
+        let playbackStartedAt = ContinuousClock.now
         Task { @MainActor [weak self] in
-            self?.handleDidStart(utteranceID: utteranceID)
+            self?.handleDidStart(utteranceID: utteranceID, playbackStartedAt: playbackStartedAt)
         }
     }
 

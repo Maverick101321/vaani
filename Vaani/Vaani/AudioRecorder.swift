@@ -25,10 +25,58 @@ public enum AudioRecorderError: LocalizedError {
     }
 }
 
+/// Reason why recording stopped (VAD silence, manual tap, or timeout).
+nonisolated public enum VADStopTrigger: String, Sendable {
+    case silence = "silence"
+    case manual = "manual"
+    case timeout = "timeout"
+}
+
+/// Metadata emitted when VAD or manual stop ends a recording session.
+nonisolated public struct VADStopEvent: Sendable {
+    public let trigger: VADStopTrigger
+    public let speechDetected: Bool
+    public let speechStartMs: Int
+    public let endOfSpeechMs: Int
+    public let silenceMs: Int
+    public let endOfSpeechInstant: ContinuousClock.Instant
+
+    public init(
+        trigger: VADStopTrigger,
+        speechDetected: Bool,
+        speechStartMs: Int,
+        endOfSpeechMs: Int,
+        silenceMs: Int = 0,
+        endOfSpeechInstant: ContinuousClock.Instant
+    ) {
+        self.trigger = trigger
+        self.speechDetected = speechDetected
+        self.speechStartMs = speechStartMs
+        self.endOfSpeechMs = endOfSpeechMs
+        self.silenceMs = silenceMs
+        self.endOfSpeechInstant = endOfSpeechInstant
+    }
+}
+
 /// AVAudioEngine-based microphone capture service.
-/// Records mono 16 kHz Float32 PCM samples and exposes real-time audio levels.
+/// Records mono 16 kHz Float32 PCM samples and exposes real-time audio levels and energy-based VAD auto-stop.
 @Observable
 nonisolated public final class AudioRecorder: @unchecked Sendable {
+    // MARK: - VAD Constants
+
+    /// Ignore the first 300 ms of audio after mic start to skip tap/Pop transients.
+    public static let vadInitialIgnoreMs: Double = 300.0
+    /// Energy threshold in dB above which speech is detected.
+    public static let vadSpeechThresholdDB: Float = -45.0
+    /// Short hangover (ms) after energy dips below threshold before silence counting begins.
+    public static let vadHangoverMs: Double = 150.0
+    /// Total silence duration (ms) following detected speech before auto-stopping (800 ms).
+    public static let vadSilenceAutoStopMs: Double = 800.0
+    /// Timeout (ms) when no speech is detected at all (6 s).
+    public static let vadNoSpeechTimeoutMs: Double = 6000.0
+    /// Maximum recording duration (ms) before automatic cutoff (15 s).
+    public static let vadMaxRecordingMs: Double = 15000.0
+
     // MARK: - Properties
     
     /// Live audio input level for metering, normalized between 0.0 and 1.0.
@@ -40,6 +88,10 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
     /// Optional callback invoked on MainActor when the live audio level changes.
     @ObservationIgnored
     public var onLevelChange: (@MainActor @Sendable (Float) -> Void)?
+
+    /// Optional callback invoked on MainActor when VAD automatically triggers a stop (`silence` or `timeout`).
+    @ObservationIgnored
+    public var onVADAutoStop: (@MainActor @Sendable (VADStopEvent) -> Void)?
     
     // MARK: - Concurrency & Synchronization
     
@@ -55,6 +107,16 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
     private var bufferCount: Int = 0
     private var minDB: Float = .greatestFiniteMagnitude
     private var maxDB: Float = -.greatestFiniteMagnitude
+
+    // VAD state protected by `lock`
+    private var recordingStartInstant: ContinuousClock.Instant = .now
+    private var speechDetected: Bool = false
+    private var consecutiveSpeechBuffers: Int = 0
+    private var candidateSpeechStartMs: Double?
+    private var speechStartMs: Int = -1
+    private var lastSpeechActivityMs: Double = 0.0
+    private var didEmitVADStop: Bool = false
+    private var lastVADStopEvent: VADStopEvent?
     
     // Engine lifecycle state - accessed strictly on audioQueue
     private var audioEngine: AVAudioEngine?
@@ -153,12 +215,21 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
             throw AudioRecorderError.converterCreationFailed
         }
         
+        let startInstant = ContinuousClock.now
         lock.lock()
         recordedSamples.removeAll()
         smoothedLevel = 0.0
         bufferCount = 0
         minDB = .greatestFiniteMagnitude
         maxDB = -.greatestFiniteMagnitude
+        recordingStartInstant = startInstant
+        speechDetected = false
+        consecutiveSpeechBuffers = 0
+        candidateSpeechStartMs = nil
+        speechStartMs = -1
+        lastSpeechActivityMs = 0.0
+        didEmitVADStop = false
+        lastVADStopEvent = nil
         lock.unlock()
         
         if hasInstalledTap {
@@ -193,7 +264,10 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
             let clamped = min(max((dB + 55.0) / 35.0, 0.0), 1.0)
             let rawLevel = pow(clamped, 0.6)
             
-            // Smoothing: fast attack (0.7 new + 0.3 old), slower release (0.2 new + 0.8 old)
+            let nowInstant = ContinuousClock.now
+            var autoStopEventToEmit: VADStopEvent? = nil
+
+            // Smoothing + VAD state machine under lock
             self.lock.lock()
             let oldLevel = self.smoothedLevel
             let smoothed: Float
@@ -213,18 +287,96 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
             
             self.bufferCount += 1
             let count = self.bufferCount
+
+            let elapsedMs = Self.milliseconds(from: self.recordingStartInstant, to: nowInstant)
+            if !self.didEmitVADStop && elapsedMs >= Self.vadInitialIgnoreMs {
+                let isSpeechFrame = dB >= Self.vadSpeechThresholdDB
+                if isSpeechFrame {
+                    self.consecutiveSpeechBuffers += 1
+                    if self.candidateSpeechStartMs == nil {
+                        self.candidateSpeechStartMs = elapsedMs
+                    }
+                    // Require at least 2 consecutive speech frames (~40ms) to confirm speech onset
+                    if !self.speechDetected && self.consecutiveSpeechBuffers >= 2 {
+                        self.speechDetected = true
+                        self.speechStartMs = Int((self.candidateSpeechStartMs ?? elapsedMs).rounded())
+                    }
+                    if self.speechDetected {
+                        // Extend speech activity with short hangover
+                        self.lastSpeechActivityMs = elapsedMs + Self.vadHangoverMs
+                    }
+                } else {
+                    self.consecutiveSpeechBuffers = 0
+                    if !self.speechDetected {
+                        self.candidateSpeechStartMs = nil
+                    }
+                }
+
+                // Check VAD stop conditions:
+                // (a) ~800 ms of silence after speech was detected (accounting for hangover)
+                let silenceSinceLastVoiceMs = elapsedMs - (self.lastSpeechActivityMs - Self.vadHangoverMs)
+                if self.speechDetected && elapsedMs > self.lastSpeechActivityMs && silenceSinceLastVoiceMs >= Self.vadSilenceAutoStopMs {
+                    self.didEmitVADStop = true
+                    let endMs = Int(elapsedMs.rounded())
+                    let measuredSilenceMs = max(0, Int(silenceSinceLastVoiceMs.rounded()))
+                    let event = VADStopEvent(
+                        trigger: .silence,
+                        speechDetected: true,
+                        speechStartMs: self.speechStartMs,
+                        endOfSpeechMs: endMs,
+                        silenceMs: measuredSilenceMs,
+                        endOfSpeechInstant: nowInstant
+                    )
+                    self.lastVADStopEvent = event
+                    autoStopEventToEmit = event
+                } else if !self.speechDetected && elapsedMs >= Self.vadNoSpeechTimeoutMs {
+                    // (b) No speech detected within 6 s -> stop and show "Didn't catch that"
+                    self.didEmitVADStop = true
+                    let endMs = Int(elapsedMs.rounded())
+                    let event = VADStopEvent(
+                        trigger: .timeout,
+                        speechDetected: false,
+                        speechStartMs: -1,
+                        endOfSpeechMs: endMs,
+                        silenceMs: endMs,
+                        endOfSpeechInstant: nowInstant
+                    )
+                    self.lastVADStopEvent = event
+                    autoStopEventToEmit = event
+                } else if elapsedMs >= Self.vadMaxRecordingMs {
+                    // (c) Max recording 15 s
+                    self.didEmitVADStop = true
+                    let endMs = Int(elapsedMs.rounded())
+                    let measuredSilenceMs = self.speechDetected ? max(0, Int(silenceSinceLastVoiceMs.rounded())) : endMs
+                    let event = VADStopEvent(
+                        trigger: .timeout,
+                        speechDetected: self.speechDetected,
+                        speechStartMs: self.speechStartMs,
+                        endOfSpeechMs: endMs,
+                        silenceMs: measuredSilenceMs,
+                        endOfSpeechInstant: nowInstant
+                    )
+                    self.lastVADStopEvent = event
+                    autoStopEventToEmit = event
+                }
+            }
             self.lock.unlock()
+            let autoStopEvent = autoStopEventToEmit
             
             // DEBUG: Print RMS, dB, min/max dB, and level every ~10 buffers for calibration
             if count % 10 == 0 {
                 print(String(format: "[AudioRecorder DEBUG] buffer #%d | RMS: %.5f | dB: %.2f (min: %.2f, max: %.2f) | Level: %.3f", count, rms, dB, currentMinDB, currentMaxDB, currentLevel))
             }
             
-            // Dispatch level update to MainActor so @Observable view model refreshes UI
+            // Dispatch level update (and optional VAD auto-stop) to MainActor
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 self.audioLevel = currentLevel
                 self.onLevelChange?(currentLevel)
+                if let event = autoStopEvent {
+                    print("[VAD] speechStart=\(event.speechStartMs) endOfSpeech=\(event.endOfSpeechMs) silence_ms=\(event.silenceMs) trigger=\(event.trigger.rawValue)")
+                    self.onVADAutoStop?(event)
+                }
             }
             
             // 2. Resample to mono 16 kHz Float32 samples
@@ -314,9 +466,11 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
     }
     
     /// Stops recording and returns accumulated mono 16 kHz Float32 samples.
+    /// If VAD had not already auto-stopped this session, logs `[VAD] ... trigger=manual`.
     /// Engine teardown and AVAudioSession deactivation execute asynchronously on audioQueue off the main thread.
     @discardableResult
     public func stop() -> [Float] {
+        let nowInstant = ContinuousClock.now
         lock.lock()
         let samples = recordedSamples
         recordedSamples.removeAll()
@@ -324,6 +478,26 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
         bufferCount = 0
         minDB = .greatestFiniteMagnitude
         maxDB = -.greatestFiniteMagnitude
+
+        let alreadyLoggedVAD = didEmitVADStop
+        if !alreadyLoggedVAD {
+            didEmitVADStop = true
+            let elapsedDouble = Self.milliseconds(from: recordingStartInstant, to: nowInstant)
+            let elapsedMs = Int(elapsedDouble.rounded())
+            let silenceSinceLastVoice = speechDetected
+                ? max(0, Int((elapsedDouble - (lastSpeechActivityMs - Self.vadHangoverMs)).rounded()))
+                : elapsedMs
+            let event = VADStopEvent(
+                trigger: .manual,
+                speechDetected: speechDetected,
+                speechStartMs: speechStartMs,
+                endOfSpeechMs: elapsedMs,
+                silenceMs: silenceSinceLastVoice,
+                endOfSpeechInstant: nowInstant
+            )
+            lastVADStopEvent = event
+            print("[VAD] speechStart=\(event.speechStartMs) endOfSpeech=\(event.endOfSpeechMs) silence_ms=\(event.silenceMs) trigger=\(event.trigger.rawValue)")
+        }
         lock.unlock()
         
         audioQueue.async { [weak self] in
@@ -338,5 +512,11 @@ nonisolated public final class AudioRecorder: @unchecked Sendable {
         }
         
         return samples
+    }
+
+    private nonisolated static func milliseconds(from start: ContinuousClock.Instant, to end: ContinuousClock.Instant) -> Double {
+        let elapsed = end - start
+        let (seconds, attoseconds) = elapsed.components
+        return Double(seconds) * 1000.0 + Double(attoseconds) / 1_000_000_000_000_000.0
     }
 }

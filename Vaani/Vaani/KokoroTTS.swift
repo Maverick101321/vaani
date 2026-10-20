@@ -245,6 +245,7 @@ nonisolated private final class KokoroStreamContext: @unchecked Sendable {
     private let lock = NSLock()
     private var _isCancelled: Bool = false
     private var _firstAudioMs: Double?
+    private var _didStartPlayback: Bool = false
     private var _scheduledChunks: Int = 0
     private var _completedChunks: Int = 0
     private var _totalSamplesScheduled: Int = 0
@@ -257,6 +258,7 @@ nonisolated private final class KokoroStreamContext: @unchecked Sendable {
     let playerNode: AVAudioPlayerNode
     let engine: AVAudioEngine
     let onFirstAudio: (@MainActor @Sendable (Double) -> Void)?
+    let onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)?
 
     init(
         startTime: ContinuousClock.Instant,
@@ -264,7 +266,8 @@ nonisolated private final class KokoroStreamContext: @unchecked Sendable {
         playbackFormat: AVAudioFormat,
         playerNode: AVAudioPlayerNode,
         engine: AVAudioEngine,
-        onFirstAudio: (@MainActor @Sendable (Double) -> Void)?
+        onFirstAudio: (@MainActor @Sendable (Double) -> Void)?,
+        onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)?
     ) {
         self.startTime = startTime
         self.sampleRate = sampleRate
@@ -272,6 +275,8 @@ nonisolated private final class KokoroStreamContext: @unchecked Sendable {
         self.playerNode = playerNode
         self.engine = engine
         self.onFirstAudio = onFirstAudio
+        self.onPlaybackStarted = onPlaybackStarted
+        installPlaybackTap()
     }
 
     var isCancelled: Bool {
@@ -325,7 +330,6 @@ nonisolated private final class KokoroStreamContext: @unchecked Sendable {
             }
         }
 
-        var recordedFirstAudio: Double?
         lock.lock()
         if _isCancelled {
             lock.unlock()
@@ -333,33 +337,57 @@ nonisolated private final class KokoroStreamContext: @unchecked Sendable {
         }
         _scheduledChunks += 1
         _totalSamplesScheduled += count
-        let isFirstChunk = (_firstAudioMs == nil)
-        if isFirstChunk {
-            let elapsed = (ContinuousClock.now - startTime).milliseconds
-            _firstAudioMs = elapsed
-            recordedFirstAudio = elapsed
-        }
         lock.unlock()
+
+        if !engine.isRunning {
+            try? engine.start()
+        }
+        if !playerNode.isPlaying {
+            try? playerNode.playAudio()
+        }
 
         playerNode.scheduleBuffer(pcmBuffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             self?.handleChunkCompleted()
         }
 
-        if isFirstChunk {
-            if !engine.isRunning {
-                try? engine.start()
-            }
-            if !playerNode.isPlaying {
-                try? playerNode.playAudio()
-            }
-            if let firstMs = recordedFirstAudio, let callback = onFirstAudio {
-                Task { @MainActor in
-                    callback(firstMs)
-                }
-            }
-        }
-
         return !isCancelled
+    }
+
+    /// The mixer tap runs on the render path.  Recording this instant, rather than
+    /// buffer scheduling, makes the latency metric reflect the first audible sample.
+    private func installPlaybackTap() {
+        try? engine.mainMixerNode.__installTap(onBus: 0, bufferSize: 256, format: nil, error: ()) { [weak self] buffer, _ in
+            guard let self else { return }
+            self.lock.lock()
+            let alreadyStarted = self._didStartPlayback || self._isCancelled
+            self.lock.unlock()
+            guard !alreadyStarted else { return }
+            guard buffer.frameLength > 0,
+                  let samples = buffer.floatChannelData?[0] else { return }
+            let containsAudio = (0..<Int(buffer.frameLength)).contains { abs(samples[$0]) > 0.000_01 }
+            guard containsAudio else { return }
+            self.recordPlaybackStartIfNeeded(at: ContinuousClock.now)
+        }
+    }
+
+    private func recordPlaybackStartIfNeeded(at instant: ContinuousClock.Instant) {
+        let firstAudioMs: Double
+        lock.lock()
+        guard !_isCancelled, !_didStartPlayback else {
+            lock.unlock()
+            return
+        }
+        _didStartPlayback = true
+        firstAudioMs = (instant - startTime).milliseconds
+        _firstAudioMs = firstAudioMs
+        lock.unlock()
+
+        engine.mainMixerNode.removeTap(onBus: 0)
+
+        onPlaybackStarted?(instant)
+        if let onFirstAudio {
+            Task { @MainActor in onFirstAudio(firstAudioMs) }
+        }
     }
 
     private func handleChunkCompleted() {
@@ -377,6 +405,63 @@ nonisolated private final class KokoroStreamContext: @unchecked Sendable {
 
     /// Marks synthesis generation as finished and suspends until all scheduled audio buffers have finished playing
     /// (or `cancel()` is invoked).
+    private var _accumulatedSynthMs: Double = 0
+    private var _accumulatedSamples: Int = 0
+    private var _accumulatedTexts: [String] = []
+    private var _speakerID: Int = KokoroSpeaker.defaultHindiSpeakerID
+    private var _speakerName: String = "hf_beta"
+    private var _kokoroLang: String = "hi"
+    private var _strategyLabel: String = KokoroStrategy.k2DevanagariMixHi.rawValue
+    private var _effectiveSpeed: Float = 1.1
+
+    func recordChunkMetrics(
+        synthMs: Double,
+        samples: Int,
+        spokenText: String,
+        speakerID: Int,
+        speakerName: String,
+        kokoroLang: String,
+        strategyLabel: String,
+        effectiveSpeed: Float
+    ) {
+        lock.lock()
+        _accumulatedSynthMs += synthMs
+        _accumulatedSamples += samples
+        if !spokenText.isEmpty {
+            _accumulatedTexts.append(spokenText)
+        }
+        _speakerID = speakerID
+        _speakerName = speakerName
+        _kokoroLang = kokoroLang
+        _strategyLabel = strategyLabel
+        _effectiveSpeed = effectiveSpeed
+        lock.unlock()
+    }
+
+    func snapshotTurnTotals() -> (
+        synthMs: Double,
+        samples: Int,
+        spokenText: String,
+        speakerID: Int,
+        speakerName: String,
+        kokoroLang: String,
+        strategyLabel: String,
+        effectiveSpeed: Float
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (
+            _accumulatedSynthMs,
+            max(_totalSamplesScheduled, _accumulatedSamples),
+            _accumulatedTexts.joined(separator: " "),
+            _speakerID,
+            _speakerName,
+            _kokoroLang,
+            _strategyLabel,
+            _effectiveSpeed
+        )
+    }
+
     func waitForPlaybackCompletion() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             lock.lock()
@@ -400,6 +485,7 @@ nonisolated private final class KokoroStreamContext: @unchecked Sendable {
         _completionContinuation = nil
         lock.unlock()
 
+        engine.mainMixerNode.removeTap(onBus: 0)
         if playerNode.isPlaying {
             playerNode.stop()
         }
@@ -444,6 +530,7 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
     private var _lastMetrics: KokoroSynthesisMetrics?
     private var _activeStreamContext: KokoroStreamContext?
     private var _onFirstAudio: (@MainActor @Sendable (Double) -> Void)?
+    private var _onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)?
     private var _onMetrics: (@MainActor @Sendable (KokoroSynthesisMetrics) -> Void)?
 
     /// Dedicated high-priority serial queue for C++ `sherpa-onnx` model loading and synthesis so ONNX Runtime threads run on P-cores.
@@ -506,7 +593,7 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         }
     }
 
-    /// Speech speed multiplier (`0.8 ... 1.3`, default `1.0`).
+    /// Speech speed multiplier (`0.8 ... 1.3`, default `1.1`).
     public var speed: Float {
         get {
             lock.lock()
@@ -527,7 +614,7 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         return _lastMetrics
     }
 
-    /// Callback invoked on `MainActor` as soon as the first audio buffer is scheduled for playback.
+    /// Callback invoked on `MainActor` when the first audio sample reaches the mixer render path.
     public var onFirstAudio: (@MainActor @Sendable (Double) -> Void)? {
         get {
             lock.lock()
@@ -537,6 +624,20 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         set {
             lock.lock()
             _onFirstAudio = newValue
+            lock.unlock()
+        }
+    }
+
+    /// Timestamp captured on the audio render path when audible playback starts.
+    public var onPlaybackStarted: (@Sendable (ContinuousClock.Instant) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _onPlaybackStarted
+        }
+        set {
+            lock.lock()
+            _onPlaybackStarted = newValue
             lock.unlock()
         }
     }
@@ -559,7 +660,7 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         hinglishStrategy: KokoroStrategy = .k2DevanagariMixHi,
         hindiSpeakerID: Int = KokoroSpeaker.defaultHindiSpeakerID,
         englishSpeakerID: Int = KokoroSpeaker.defaultEnglishSpeakerID,
-        speed: Float = 1.0,
+        speed: Float = 1.1,
         sessionQueue: DispatchQueue = AudioRecorder.sharedAudioSessionQueue
     ) {
         self._hinglishStrategy = hinglishStrategy
@@ -692,14 +793,16 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         let speakers = Int(wrapper.numSpeakers)
         let loadMs = (ContinuousClock.now - loadStart).milliseconds
 
-        // Silent warmup synthesis for a full short clause so ONNX Runtime arena allocations and espeak-ng phonemizer tables are hot before first user utterance
+        // Silent warmup synthesis for a full short clause and a 3-word first chunk so ONNX Runtime arena allocations, HinglishTransliterator, and espeak-ng phonemizer tables are hot before first user utterance
         let warmupStart = ContinuousClock.now
+        _ = HinglishTransliterator.transliterate("Alarm kal subah 7 baje")
         let warmupHiConfig = SherpaOnnxGenerationConfigSwift(
-            speed: 1.0,
+            speed: 1.1,
             sid: KokoroSpeaker.defaultHindiSpeakerID,
             extra: ["lang": "hi"]
         )
         _ = wrapper.generateWithConfig(text: "नमस्ते, आज मौसम सुहाना है।", config: warmupHiConfig, callback: nil, arg: nil)
+        _ = wrapper.generateWithConfig(text: "अलार्म कल सुबह", config: warmupHiConfig, callback: nil, arg: nil)
         let warmupMs = (ContinuousClock.now - warmupStart).milliseconds
 
         lock.lock()
@@ -725,11 +828,36 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Ensures the model and warmup synthesis have completed on `inferenceQueue` before the first turn runs.
+    private nonisolated func ensureReadyBeforeSynthesis() async throws {
+        if isReady { return }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                if self.isReady {
+                    continuation.resume()
+                    return
+                }
+                do {
+                    try self.loadModelSync()
+                    self.updateLoadingState(.ready)
+                    continuation.resume()
+                } catch {
+                    self.updateLoadingState(.failed(error.localizedDescription))
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     // MARK: - Clause Splitting for Low First-Audio Latency
 
-    /// Splits an utterance into sentences or short clauses so Clause 1 (~3–5 words, ~18–30 chars) can be synthesized
-    /// and played in ~0.9–1.3s while remaining clauses are synthesized and queued onto `AVAudioPlayerNode`.
-    public static nonisolated func splitIntoClauses(_ text: String) -> [String] {
+    /// Splits an utterance into sentences or short clauses so Clause 1 (<=4 words, <=22 chars) can be synthesized
+    /// and played in ~400–650 ms while remaining clauses are synthesized and queued onto `AVAudioPlayerNode`.
+    public static nonisolated func splitIntoClauses(_ text: String, isFirstChunk: Bool = true) -> [String] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
@@ -752,17 +880,18 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
             rawParts.append(remainder)
         }
 
-        // Merge tiny fragments (< 12 chars, e.g. "हाँ," or "OK,") into the next clause so Clause 1 has enough audio
-        // (~1.2s+) to cover Clause 2 synthesis, then aggressively cap Clause 1 at ~28 chars / 4-5 words.
+        // Merge tiny fragments (< 8 chars for Clause 1, < 12 chars for later clauses) into the next clause,
+        // then split Clause 1 at the first comma/clause or after 3–4 words (<= 22 chars) so synthesis starts immediately.
         var merged: [String] = []
         var pendingPrefix = ""
 
         for part in rawParts {
             let combined = pendingPrefix.isEmpty ? part : "\(pendingPrefix) \(part)"
-            if combined.count < 12 {
+            let isFirst = isFirstChunk && merged.isEmpty
+            let minChars = isFirst ? 8 : 12
+            if combined.count < minChars {
                 pendingPrefix = combined
             } else {
-                let isFirst = merged.isEmpty
                 merged.append(contentsOf: splitClauseForLowLatency(combined, isFirstClause: isFirst))
                 pendingPrefix = ""
             }
@@ -779,8 +908,8 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
     }
 
     private static nonisolated func splitClauseForLowLatency(_ clause: String, isFirstClause: Bool) -> [String] {
-        let maxChars = isFirstClause ? 28 : 48
-        let maxWords = isFirstClause ? 5 : 8
+        let maxChars = isFirstClause ? 22 : 48
+        let maxWords = isFirstClause ? 4 : 8
 
         let words = clause.split(whereSeparator: \.isWhitespace).map(String.init)
         if clause.count <= maxChars && words.count <= maxWords {
@@ -793,28 +922,56 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
             " के बाद ", " के साथ ", " के लिए ", " लगभग ",
             " and ", " but ", " so ", " because ", " with ", " while ", " when ", " if ", " after ", " before ", " where ", " around ", " at "
         ]
+        let maxLeftChars = isFirstClause ? maxChars : (maxChars + 10)
         for conj in phraseConjunctions {
             if let range = clause.range(of: conj, options: .caseInsensitive) {
                 let left = String(clause[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                 let right = String(clause[range.lowerBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                 let leftWords = left.split(whereSeparator: \.isWhitespace).count
                 let rightWords = right.split(whereSeparator: \.isWhitespace).count
-                if left.count >= 12, leftWords >= 3, left.count <= maxChars + 10, right.count >= 10, rightWords >= 2 {
+                let minLeftChars = isFirstClause ? 8 : 12
+                let minLeftWords = isFirstClause ? 2 : 3
+                if left.count >= minLeftChars, leftWords >= minLeftWords, leftWords <= maxWords, left.count <= maxLeftChars, right.count >= 6, rightWords >= 2 {
                     return [left] + splitClauseForLowLatency(right, isFirstClause: false)
                 }
             }
         }
 
         // 2. Fallback word-boundary split when a clause has no comma or conjunction within the target window
-        let targetWordCount = isFirstClause ? 4 : 7
+        if isFirstClause {
+            guard words.count >= 2 else { return [clause] }
+            let hindiPostpositions: Set<String> = ["में", "पर", "को", "से", "के", "का", "की", "ने", "तक", "भी", "ही", "बजे", "लिए"]
+            var bestSplit = min(3, words.count - 1)
+            while bestSplit > 1 {
+                let candidate = words[..<bestSplit].joined(separator: " ")
+                if candidate.count <= maxChars && bestSplit <= maxWords {
+                    break
+                }
+                bestSplit -= 1
+            }
+            if bestSplit < words.count - 1, hindiPostpositions.contains(words[bestSplit]) {
+                let extended = words[..<(bestSplit + 1)].joined(separator: " ")
+                if extended.count <= maxChars && (bestSplit + 1) <= maxWords {
+                    bestSplit += 1
+                }
+            }
+            let leftChunk = words[..<bestSplit].joined(separator: " ")
+            let rightChunk = words[bestSplit...].joined(separator: " ")
+            guard !leftChunk.isEmpty, !rightChunk.isEmpty else {
+                return [clause]
+            }
+            return [leftChunk] + splitClauseForLowLatency(rightChunk, isFirstClause: false)
+        }
+
+        let targetWordCount = 7
         guard words.count >= targetWordCount + 2 else {
             return [clause]
         }
 
         var splitIndex = min(targetWordCount, words.count - 2)
 
-        // Keep Hindi postpositions attached to the preceding noun ("बेंगलुरु में", "शाम को", "5 बजे तक")
-        let hindiPostpositions: Set<String> = ["में", "पर", "को", "से", "के", "का", "की", "ने", "तक", "भी", "ही", "बजे"]
+        // Keep Hindi postpositions attached to the preceding noun ("बेंगलुरु में", "शाम को", "सात बजे")
+        let hindiPostpositions: Set<String> = ["में", "पर", "को", "से", "के", "का", "की", "ने", "तक", "भी", "ही", "बजे", "लिए"]
         if splitIndex < words.count - 2, hindiPostpositions.contains(words[splitIndex]) {
             splitIndex += 1
         }
@@ -848,6 +1005,201 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         activeContext?.cancel()
     }
 
+    // MARK: - Turn-Level Streaming Queue API (for LLM Token Streaming)
+
+    /// Synthesizes and queues a streamed sentence/clause chunk onto a shared `AVAudioPlayerNode` session.
+    /// Chunk 1 starts playback immediately; subsequent chunks are synthesized on `inferenceQueue` while earlier chunks play,
+    /// scheduling back-to-back PCM buffers with zero gaps or overlap.
+    public nonisolated func enqueueStreamingChunk(
+        text: String,
+        language: VoiceAgentViewModel.Language,
+        isFirstChunk: Bool,
+        strategyOverride: KokoroStrategy? = nil,
+        speakerIDOverride: Int? = nil,
+        speedOverride: Float? = nil
+    ) async throws -> (firstAudioMs: Double, synthMs: Double, sampleCount: Int) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return (0, 0, 0)
+        }
+        try await ensureReadyBeforeSynthesis()
+        try Task.checkCancellation()
+
+        let effectiveStrategy = strategyOverride ?? self.hinglishStrategy
+        let effectiveSpeed = min(1.3, max(0.8, speedOverride ?? self.speed))
+        let firstAudioCallback = self.onFirstAudio
+        let playbackStartedCallback = self.onPlaybackStarted
+
+        let spokenText: String
+        let strategyLabel: String
+        let kokoroLang: String
+        let speakerID: Int
+
+        switch language {
+        case .english:
+            if let strategyOverride {
+                strategyLabel = strategyOverride.rawValue
+                kokoroLang = strategyOverride.kokoroLang
+                speakerID = speakerIDOverride ?? strategyOverride.defaultSpeakerID
+                spokenText = (strategyOverride == .k2DevanagariMixHi)
+                    ? HinglishTransliterator.transliterate(trimmed)
+                    : trimmed
+            } else {
+                strategyLabel = "englishDefault"
+                kokoroLang = "en-us"
+                speakerID = speakerIDOverride ?? self.englishSpeakerID
+                spokenText = trimmed
+            }
+        case .hinglish:
+            strategyLabel = effectiveStrategy.rawValue
+            kokoroLang = effectiveStrategy.kokoroLang
+            if let speakerIDOverride {
+                speakerID = speakerIDOverride
+            } else {
+                switch effectiveStrategy {
+                case .k1RomanizedHi, .k2DevanagariMixHi:
+                    speakerID = self.hindiSpeakerID
+                case .k3RomanizedEnUS:
+                    speakerID = self.englishSpeakerID
+                }
+            }
+            spokenText = (effectiveStrategy == .k2DevanagariMixHi)
+                ? HinglishTransliterator.transliterate(trimmed)
+                : trimmed
+        }
+
+        let speakerInfo = KokoroSpeaker.speaker(forID: speakerID)
+
+        let streamContext: KokoroStreamContext
+        if isFirstChunk || currentActiveStreamContext() == nil {
+            stop()
+            try await configurePlaybackAudioSession()
+            try Task.checkCancellation()
+
+            let sampleRate = self.currentSampleRate()
+            guard let playbackFormat = AVAudioFormat(
+                standardFormatWithSampleRate: sampleRate,
+                channels: 1
+            ) else {
+                throw KokoroTTSError.engineInitializationFailed
+            }
+
+            let engine = AVAudioEngine()
+            let playerNode = AVAudioPlayerNode()
+            engine.attach(playerNode)
+            try engine.connectNode(playerNode, to: engine.mainMixerNode, format: playbackFormat)
+            engine.prepare()
+            try? engine.start()
+            try? playerNode.playAudio()
+
+            let newContext = KokoroStreamContext(
+                startTime: ContinuousClock.now,
+                sampleRate: sampleRate,
+                playbackFormat: playbackFormat,
+                playerNode: playerNode,
+                engine: engine,
+                onFirstAudio: firstAudioCallback,
+                onPlaybackStarted: playbackStartedCallback
+            )
+            setActiveStreamContext(newContext)
+            streamContext = newContext
+        } else if let existing = currentActiveStreamContext(), !existing.isCancelled {
+            streamContext = existing
+        } else {
+            throw CancellationError()
+        }
+
+        let chunkStart = ContinuousClock.now
+        let (synthMs, sampleCount) = try await runSynthesisOnQueue(
+            spokenText: spokenText,
+            speakerID: speakerID,
+            speed: effectiveSpeed,
+            kokoroLang: kokoroLang,
+            streamContext: streamContext,
+            isFirstChunk: isFirstChunk
+        )
+        let chunkFirstAudioMs = isFirstChunk
+            ? (streamContext.firstAudioMs ?? synthMs)
+            : (ContinuousClock.now - chunkStart).milliseconds
+
+        streamContext.recordChunkMetrics(
+            synthMs: synthMs,
+            samples: sampleCount,
+            spokenText: spokenText,
+            speakerID: speakerID,
+            speakerName: speakerInfo.name,
+            kokoroLang: kokoroLang,
+            strategyLabel: strategyLabel,
+            effectiveSpeed: effectiveSpeed
+        )
+
+        if streamContext.isCancelled {
+            throw CancellationError()
+        }
+
+        return (chunkFirstAudioMs, synthMs, sampleCount)
+    }
+
+    /// Waits for all queued streaming chunks in the current turn to finish playing and emits final `KokoroSynthesisMetrics`.
+    @discardableResult
+    public nonisolated func finishStreamingTurn() async -> KokoroSynthesisMetrics? {
+        guard let streamContext = currentActiveStreamContext() else {
+            return nil
+        }
+
+        await streamContext.waitForPlaybackCompletion()
+        let totalDurationMs = (ContinuousClock.now - streamContext.startTime).milliseconds
+        let sampleRate = self.currentSampleRate()
+        let snapshot = streamContext.snapshotTurnTotals()
+        let firstAudioMs = streamContext.firstAudioMs ?? snapshot.synthMs
+        let audioDurationSec = Double(snapshot.samples) / sampleRate
+        let rtf = audioDurationSec > 0 ? (snapshot.synthMs / 1_000.0) / audioDurationSec : 0.0
+
+        clearActiveStreamContext(streamContext)
+        streamContext.cancel()
+
+        print(String(
+            format: "[TTS DEBUG] engine=Kokoro sid=%d (%@) strategy=%@ lang=%@ speed=%.2f firstAudioMs=%.0f synthMs=%.0f playMs=%.0f audioSec=%.2f rtf=%.3f text=%@",
+            snapshot.speakerID,
+            snapshot.speakerName,
+            snapshot.strategyLabel,
+            snapshot.kokoroLang,
+            snapshot.effectiveSpeed,
+            firstAudioMs,
+            snapshot.synthMs,
+            totalDurationMs,
+            audioDurationSec,
+            rtf,
+            snapshot.spokenText.debugDescription
+        ))
+
+        let metrics = KokoroSynthesisMetrics(
+            firstAudioMs: firstAudioMs,
+            synthMs: snapshot.synthMs,
+            totalDurationMs: totalDurationMs,
+            audioDurationSec: audioDurationSec,
+            rtf: rtf,
+            speakerID: snapshot.speakerID,
+            speakerName: snapshot.speakerName,
+            lang: snapshot.kokoroLang,
+            strategy: snapshot.strategyLabel,
+            speed: snapshot.effectiveSpeed,
+            spokenText: snapshot.spokenText
+        )
+
+        storeLastMetrics(metrics)
+        if let metricsCallback = self.onMetrics {
+            await metricsCallback(metrics)
+        }
+        return metrics
+    }
+
+    private nonisolated func currentActiveStreamContext() -> KokoroStreamContext? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _activeStreamContext
+    }
+
     // MARK: - Extended Streaming Synthesis API
 
     /// Synthesizes and plays `text` via streaming `AVAudioPlayerNode` buffers, returning full timing and RTF metrics.
@@ -871,14 +1223,12 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
                 speakerName: "none",
                 lang: "",
                 strategy: "empty",
-                speed: 1.0,
+                speed: 1.1,
                 spokenText: ""
             )
         }
 
-        guard isReady else {
-            throw KokoroTTSError.modelNotReady
-        }
+        try await ensureReadyBeforeSynthesis()
 
         try Task.checkCancellation()
 
@@ -894,6 +1244,7 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         let effectiveStrategy = strategyOverride ?? self.hinglishStrategy
         let effectiveSpeed = min(1.3, max(0.8, speedOverride ?? self.speed))
         let firstAudioCallback = self.onFirstAudio
+        let playbackStartedCallback = self.onPlaybackStarted
         let metricsCallback = self.onMetrics
 
         let spokenText: String
@@ -961,7 +1312,8 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
             playbackFormat: playbackFormat,
             playerNode: playerNode,
             engine: engine,
-            onFirstAudio: firstAudioCallback
+            onFirstAudio: firstAudioCallback,
+            onPlaybackStarted: playbackStartedCallback
         )
 
         setActiveStreamContext(streamContext)
@@ -978,7 +1330,8 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
                 speakerID: speakerID,
                 speed: effectiveSpeed,
                 kokoroLang: kokoroLang,
-                streamContext: streamContext
+                streamContext: streamContext,
+                isFirstChunk: true
             )
 
             // 5. Wait for all scheduled buffers on AVAudioPlayerNode to finish playing
@@ -990,7 +1343,7 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
             let rtf = audioDurationSec > 0 ? (synthMs / 1_000.0) / audioDurationSec : 0.0
 
             print(String(
-                format: "[TTS DEBUG] engine=Kokoro sid=%d (%@) strategy=%@ lang=%@ speed=%.2f firstAudioMs=%.0f synthMs=%.0f rtf=%.3f text=%@",
+                format: "[TTS DEBUG] engine=Kokoro sid=%d (%@) strategy=%@ lang=%@ speed=%.2f firstAudioMs=%.0f synthMs=%.0f playMs=%.0f audioSec=%.2f rtf=%.3f text=%@",
                 speakerID,
                 speakerInfo.name,
                 strategyLabel,
@@ -998,6 +1351,8 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
                 effectiveSpeed,
                 firstAudioMs,
                 synthMs,
+                totalDurationMs,
+                audioDurationSec,
                 rtf,
                 spokenText.debugDescription
             ))
@@ -1036,9 +1391,10 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
         speakerID: Int,
         speed: Float,
         kokoroLang: String,
-        streamContext: KokoroStreamContext
+        streamContext: KokoroStreamContext,
+        isFirstChunk: Bool = true
     ) async throws -> (synthMs: Double, sampleCount: Int) {
-        let clauses = Self.splitIntoClauses(spokenText)
+        let clauses = Self.splitIntoClauses(spokenText, isFirstChunk: isFirstChunk)
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Double, Int), Error>) in
             inferenceQueue.async { [weak self] in
                 guard let self else {
@@ -1155,12 +1511,15 @@ nonisolated public final class KokoroTTS: TextToSpeech, @unchecked Sendable {
                 #if os(iOS) || os(visionOS)
                 do {
                     let audioSession = AVAudioSession.sharedInstance()
-                    try audioSession.setCategory(
-                        .playAndRecord,
-                        mode: .default,
-                        options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
-                    )
-                    try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                    let desiredOptions: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+                    if audioSession.category != .playAndRecord || !audioSession.categoryOptions.contains(.defaultToSpeaker) {
+                        try audioSession.setCategory(
+                            .playAndRecord,
+                            mode: .default,
+                            options: desiredOptions
+                        )
+                        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                    }
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)

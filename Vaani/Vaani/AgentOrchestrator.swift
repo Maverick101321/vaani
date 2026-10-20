@@ -272,11 +272,13 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         let systemPrompt = VaaniSystemPrompt.build(language: language)
         let tools = toolExecutor.definitions
 
-        var messages = await historyStore.recentMessages(for: language)
+        let priorHistory = await historyStore.recentMessages(for: language)
+        var messages = priorHistory
         messages.append(.user(trimmedInput))
 
         let firstTokenState = FirstTokenTracker(startClock: startClock, callback: onFirstToken)
-        let sentenceBuffer = SentenceStreamBuffer(callback: onSentenceReady)
+        let sentenceBuffer = SentenceStreamBuffer(language: language, callback: onSentenceReady)
+        let holdRoundZeroForToolCheck = Self.likelyRequiresTool(trimmedInput)
 
         var executedTools: [LLMToolCall] = []
         var executedToolOutputs: [String] = []
@@ -288,8 +290,11 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         do {
             for round in 0...Self.maxToolRounds {
                 try Task.checkCancellation()
-                // On the final round after maxToolRounds tool executions, omit tools so the model must synthesize a spoken answer
-                let activeTools = (round < Self.maxToolRounds) ? tools : []
+                // Tool calls happen in round 0; once tools have executed, round 1+ synthesizes the spoken reply without resending tool schemas
+                let activeTools = (round == 0 && round < Self.maxToolRounds) ? tools : []
+                let isPostToolFinalRound = (round > 0)
+                let roundStartClock = ContinuousClock.now
+                let roundZeroBuffer = LockedTextBuffer()
 
                 let streamResult = try await streamWithProviderFallback(
                     messages: messages,
@@ -302,25 +307,37 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
                     onTextDelta: { delta in
                         firstTokenState.recordIfNeeded()
                         let cleanDelta = Self.stripDevanagari(delta)
-                        if !cleanDelta.isEmpty {
+                        guard !cleanDelta.isEmpty else { return }
+                        if isPostToolFinalRound || !holdRoundZeroForToolCheck {
                             onTextDelta?(cleanDelta)
                             sentenceBuffer.append(cleanDelta)
+                        } else {
+                            roundZeroBuffer.append(cleanDelta)
                         }
                     }
                 )
 
+                let roundElapsedMs = Self.milliseconds(since: roundStartClock)
                 answeringProvider = streamResult.providerName
                 answeringModel = streamResult.modelName
 
                 if streamResult.toolCalls.isEmpty || round == Self.maxToolRounds {
+                    let bufferedRoundZeroText = roundZeroBuffer.value
+                    if !isPostToolFinalRound && holdRoundZeroForToolCheck && !bufferedRoundZeroText.isEmpty {
+                        onTextDelta?(bufferedRoundZeroText)
+                        sentenceBuffer.append(bufferedRoundZeroText)
+                    }
                     finalReply = Self.sanitizeSpokenReply(streamResult.text)
                     break
                 }
 
-                // Record assistant tool-call message
-                messages.append(.assistant(streamResult.text, toolCalls: streamResult.toolCalls))
+                // Tool-calling turn: discard any intermediate round-0 text so TTS speaks ONLY the final answer
+                sentenceBuffer.resetUncommitted()
 
-                // Execute each requested tool call and append tool results
+                (toolExecutor as? VaaniToolExecutor)?.currentTurnTranscriptHint = trimmedInput
+
+                let toolExecStart = ContinuousClock.now
+                var toolResultMessages: [LLMChatMessage] = []
                 for call in streamResult.toolCalls {
                     try Task.checkCancellation()
                     executedTools.append(call)
@@ -333,12 +350,55 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
                         toolOutputJSON = #"{"status":"error","message":"Tool execution failed"}"#
                     }
                     executedToolOutputs.append(toolOutputJSON)
-                    messages.append(.toolResult(id: call.id, name: call.name, content: toolOutputJSON))
+                    toolResultMessages.append(.toolResult(id: call.id, name: call.name, content: toolOutputJSON))
                 }
+                let toolExecMs = Self.milliseconds(since: toolExecStart)
+
+                // Requirement 3 (Fast path for tool replies): for set_alarm, set_reminder, get_next_meeting,
+                // get_schedule, and get_weather results with success status, build the spoken reply deterministically
+                // from the tool result using templates in the active language and skip the second LLM request.
+                if let fastReply = Self.fastPathToolReply(
+                    executedTools: executedTools,
+                    executedToolOutputs: executedToolOutputs,
+                    userText: trimmedInput,
+                    language: language,
+                    turnSeed: priorHistory.count / 2,
+                    now: Date()
+                ) {
+                    finalReply = Self.sanitizeSpokenReply(fastReply)
+                    firstTokenState.recordIfNeeded()
+                    onTextDelta?(finalReply)
+                    sentenceBuffer.append(finalReply)
+                    let toolNamesJoined = executedTools.map(\.name).joined(separator: ",")
+                    let savedMs = Int(max(650.0, roundElapsedMs).rounded())
+                    print("[FASTPATH] tool=\(toolNamesJoined) saved_ms=\(savedMs)")
+                    break
+                }
+
+                // Fallback LLM path for errors or ambiguous tool results: send the second LLM request with a trimmed history
+                // (system prompt + the user message + the tool call and result only).
+                let trimmedHistoryMsgs = priorHistory.count
+                let trimmedHistoryChars = priorHistory.reduce(0) { $0 + $1.content.count }
+                messages = [
+                    .user(trimmedInput),
+                    .assistant("", toolCalls: streamResult.toolCalls)
+                ] + toolResultMessages
+                print("[TOOL SPEEDUP] round0_ms=\(Int(roundElapsedMs.rounded())) tool_ms=\(Int(toolExecMs.rounded())) trimmed_msgs=\(trimmedHistoryMsgs) trimmed_chars=\(trimmedHistoryChars)")
             }
 
-            // Deterministic fallback: if a tool succeeded and the final reply is under 3 words or empty, generate the confirmation from the tool result
-            if !executedTools.isEmpty && Self.wordCount(of: finalReply) < 3 {
+            // Deterministic fallback: if a tool succeeded and the final reply is under 3 words or empty,
+            // OR if set_alarm returned already_exists and the reply did not mention "already", generate from tool result.
+            let isDuplicateAlarmMissingKeyword: Bool = {
+                guard executedTools.last?.name == "set_alarm",
+                      let lastOutput = executedToolOutputs.last,
+                      lastOutput.contains("already_exists") else {
+                    return false
+                }
+                let lower = finalReply.lowercased()
+                return !lower.contains("already") && !lower.contains("pehle")
+            }()
+
+            if (!executedTools.isEmpty && Self.wordCount(of: finalReply) < 3) || isDuplicateAlarmMissingKeyword {
                 if let fallback = Self.deterministicToolFallbackReply(
                     executedTools: executedTools,
                     executedToolOutputs: executedToolOutputs,
@@ -388,6 +448,9 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
             }
         }
 
+        if sentenceBuffer.emittedCount == 0 && !finalReply.isEmpty {
+            sentenceBuffer.replaceBuffer(with: finalReply)
+        }
         sentenceBuffer.flushRemaining()
 
         let totalElapsedMs = Self.milliseconds(since: startClock)
@@ -596,37 +659,105 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
     }
 
-    /// Generates a deterministic spoken confirmation/summary from the last successful tool result when the LLM reply is empty or truncated (< 3 words).
-    public nonisolated static func deterministicToolFallbackReply(
+    /// Returns `true` when the user prompt likely triggers one of Vaani's 5 tools, so round 0 buffers text until we know whether `tool_calls` were emitted.
+    private nonisolated static func likelyRequiresTool(_ text: String) -> Bool {
+        let pattern = #"(?i)\b(weather|temperature|temp|forecast|rain|mausam|baarish|barish|tapman|garmi|thandi|alarm|wake|utha|jagana|baje|remind|reminder|yaad|schedule|meeting|meetings|calendar|events|appointment|standup|sync)\b"#
+        return text.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// Builds the spoken reply deterministically from successful tool results (`set_alarm`, `set_reminder`, `get_next_meeting`,
+    /// `get_schedule`, `get_weather`) using 2–3 natural templates per tool in the active language so we can skip the second LLM round.
+    /// Returns `nil` when any tool returned an error payload so the LLM fallback handles it.
+    public nonisolated static func fastPathToolReply(
         executedTools: [LLMToolCall],
         executedToolOutputs: [String],
+        userText: String = "",
         language: VoiceAgentViewModel.Language,
+        turnSeed: Int = 0,
         now: Date = Date()
     ) -> String? {
-        guard let lastCall = executedTools.last,
-              let lastOutput = executedToolOutputs.last,
-              let data = lastOutput.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              json["error"] == nil else {
+        guard !executedTools.isEmpty,
+              executedTools.count == executedToolOutputs.count else {
             return nil
         }
 
-        switch lastCall.name {
+        var parsedPayloads: [(name: String, json: [String: Any])] = []
+        for (call, output) in zip(executedTools, executedToolOutputs) {
+            guard let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  json["error"] == nil,
+                  (json["status"] as? String) != "error" else {
+                return nil
+            }
+            parsedPayloads.append((call.name, json))
+        }
+
+        // Combined schedule + next_meeting turn (e.g. "Aaj ka schedule kya hai, aur meri next meeting kab hai?")
+        if parsedPayloads.count == 2 {
+            let names = Set(parsedPayloads.map(\.name))
+            if names == Set(["get_schedule", "get_next_meeting"]),
+               let scheduleJSON = parsedPayloads.first(where: { $0.name == "get_schedule" })?.json,
+               let nextJSON = parsedPayloads.first(where: { $0.name == "get_next_meeting" })?.json {
+                return formatCombinedScheduleAndNextMeeting(
+                    scheduleJSON: scheduleJSON,
+                    nextJSON: nextJSON,
+                    language: language,
+                    turnSeed: turnSeed,
+                    now: now
+                )
+            }
+        }
+
+        // Single-tool fast path (or last tool if multiple calls)
+        guard let last = parsedPayloads.last else { return nil }
+        let json = last.json
+        let seed = abs(turnSeed + userText.count)
+
+        switch last.name {
         case "set_alarm":
-            guard (json["status"] as? String) == "success" else { return nil }
+            let status = (json["status"] as? String) ?? ""
             let iso = json["time_iso"] as? String
             let spoken = (json["time_spoken"] as? String) ?? ""
+            if status == "already_exists" {
+                switch language {
+                case .hinglish:
+                    let phrase = friendlyHinglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                    let templates = [
+                        "Alarm already set for \(phrase).",
+                        "\(phrase.capitalized) ka alarm pehle se already set hai.",
+                        "Aapka alarm \(phrase) ke liye already set hai."
+                    ]
+                    return templates[seed % templates.count]
+                case .english:
+                    let phrase = friendlyEnglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
+                    let templates = [
+                        "That alarm is already set for \(phrase).",
+                        "You already have an alarm set for \(phrase).",
+                        "An alarm for \(phrase) is already active."
+                    ]
+                    return templates[seed % templates.count]
+                }
+            }
             switch language {
             case .hinglish:
                 let phrase = friendlyHinglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
-                return "Alarm \(phrase) ke liye set ho gaya."
+                let templates = [
+                    "Alarm \(phrase) ke liye set ho gaya.",
+                    "Aapka alarm \(phrase) ke liye set kar diya hai.",
+                    "Done, \(phrase) ka alarm set ho gaya hai."
+                ]
+                return templates[seed % templates.count]
             case .english:
                 let phrase = friendlyEnglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
-                return "Alarm set for \(phrase)."
+                let templates = [
+                    "Alarm set for \(phrase).",
+                    "Your alarm is set for \(phrase).",
+                    "Done, I have set an alarm for \(phrase)."
+                ]
+                return templates[seed % templates.count]
             }
 
         case "set_reminder":
-            guard (json["status"] as? String) == "success" else { return nil }
             let title = (json["title"] as? String) ?? "Reminder"
             let iso = (json["datetime_iso"] as? String) ?? (json["due_iso"] as? String)
             let spoken = (json["datetime_spoken"] as? String) ?? (json["due_spoken"] as? String)
@@ -634,23 +765,28 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
             case .hinglish:
                 if let spoken, !spoken.isEmpty {
                     let phrase = friendlyHinglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
-                    return "Reminder \(title) \(phrase) ke liye set ho gaya."
+                    let templates = [
+                        "Reminder \(title) \(phrase) ke liye set ho gaya.",
+                        "Aapka \(title) reminder \(phrase) ke liye set kar diya hai.",
+                        "Done, \(phrase) ke liye \(title) ka reminder set ho gaya."
+                    ]
+                    return templates[seed % templates.count]
                 }
                 return "Reminder \(title) set ho gaya."
             case .english:
                 if let spoken, !spoken.isEmpty {
                     let phrase = friendlyEnglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
-                    return "Reminder for \(title) set for \(phrase)."
+                    let templates = [
+                        "Reminder for \(title) set for \(phrase).",
+                        "I have set your \(title) reminder for \(phrase).",
+                        "Done, reminder for \(title) is scheduled for \(phrase)."
+                    ]
+                    return templates[seed % templates.count]
                 }
                 return "Reminder for \(title) has been set."
             }
 
         case "get_next_meeting":
-            if let noneStr = json["next_meeting"] as? String, noneStr == "none" {
-                return language == .hinglish
-                    ? "Aapki aage koi meeting scheduled nahi hai."
-                    : "You have no upcoming meetings scheduled."
-            }
             if let meeting = json["next_meeting"] as? [String: Any] {
                 let title = (meeting["title"] as? String) ?? "Meeting"
                 let iso = meeting["start"] as? String
@@ -658,33 +794,94 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
                 switch language {
                 case .hinglish:
                     let phrase = friendlyHinglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
-                    return "Aapki agli meeting \(title) \(phrase) hai."
+                    let templates = [
+                        "Aapki next meeting \(title) \(phrase) hai.",
+                        "Agli meeting \(title) hai, jo \(phrase) hogi.",
+                        "Aapki agli meeting \(phrase) \(title) hai."
+                    ]
+                    return templates[seed % templates.count]
                 case .english:
                     let phrase = friendlyEnglishTimePhrase(fromISO: iso, spokenFallback: spoken, now: now)
-                    return "Your next meeting is \(title) \(phrase)."
+                    let templates = [
+                        "Your next meeting is \(title) \(phrase).",
+                        "Up next is \(title), scheduled for \(phrase).",
+                        "You have \(title) coming up \(phrase)."
+                    ]
+                    return templates[seed % templates.count]
                 }
             }
-            return nil
+            switch language {
+            case .hinglish:
+                let templates = [
+                    "Aapki aage koi meeting scheduled nahi hai.",
+                    "Aaj aage koi aur meeting nahi hai.",
+                    "Abhi aapke schedule mein aage koi meeting nahi hai."
+                ]
+                return templates[seed % templates.count]
+            case .english:
+                let templates = [
+                    "You have no upcoming meetings scheduled.",
+                    "Your calendar is clear with no upcoming meetings.",
+                    "There are no more meetings on your schedule."
+                ]
+                return templates[seed % templates.count]
+            }
 
         case "get_schedule":
             let count = (json["meeting_count"] as? Int) ?? 0
             let meetings = (json["meetings"] as? [[String: Any]]) ?? []
             let dayDesc = (json["day"] as? String) ?? "today"
+            let dayWordHi = dayDesc.lowercased().contains("tomorrow") ? "Kal" : "Aaj"
             if count == 0 || meetings.isEmpty {
-                return language == .hinglish
-                    ? "Aapke schedule mein koi meeting nahi hai."
-                    : "You have no meetings scheduled for \(dayDesc)."
+                switch language {
+                case .hinglish:
+                    let templates = [
+                        "\(dayWordHi) aapke schedule mein koi meeting nahi hai.",
+                        "\(dayWordHi) koi meeting scheduled nahi hai.",
+                        "\(dayWordHi) aapka calendar bilkul khali hai."
+                    ]
+                    return templates[seed % templates.count]
+                case .english:
+                    let templates = [
+                        "You have no meetings scheduled for \(dayDesc).",
+                        "Your schedule for \(dayDesc) is completely clear.",
+                        "There are no meetings on your calendar for \(dayDesc)."
+                    ]
+                    return templates[seed % templates.count]
+                }
             }
-            let firstThree = meetings.prefix(3).compactMap { m -> String? in
-                guard let t = m["title"] as? String, let s = m["start_spoken"] as? String else { return nil }
-                return "\(t) at \(s)"
-            }.joined(separator: ", ")
-            return language == .hinglish
-                ? "Aapki \(count) \(count == 1 ? "meeting hai" : "meetings hain"): \(firstThree)."
-                : "You have \(count) \(count == 1 ? "meeting" : "meetings"): \(firstThree)."
+            switch language {
+            case .hinglish:
+                if let first = meetings.first,
+                   let firstTitle = first["title"] as? String {
+                    let firstISO = first["start"] as? String
+                    let firstSpoken = (first["start_spoken"] as? String) ?? ""
+                    let timeOnly = friendlyHinglishClockOnly(fromISO: firstISO, spokenFallback: firstSpoken)
+                    let templates = [
+                        "\(dayWordHi) aapki \(count) meetings hain, aur next \(firstTitle) \(timeOnly) hai.",
+                        "\(dayWordHi) schedule mein \(count) meetings hain, pehli \(firstTitle) \(timeOnly) hai.",
+                        "Aapki \(dayWordHi.lowercased()) \(count) meetings hain, jisme \(firstTitle) \(timeOnly) hai."
+                    ]
+                    return templates[seed % templates.count]
+                }
+                return "\(dayWordHi) aapki \(count) meetings hain."
+            case .english:
+                let firstTwo = meetings.prefix(2).compactMap { m -> String? in
+                    guard let t = m["title"] as? String else { return nil }
+                    let iso = m["start"] as? String
+                    let spoken = (m["start_spoken"] as? String) ?? ""
+                    let clock = friendlyEnglishClockOnly(fromISO: iso, spokenFallback: spoken)
+                    return "\(t) at \(clock)"
+                }.joined(separator: " and ")
+                let templates = [
+                    "You have \(count) \(count == 1 ? "meeting" : "meetings") \(dayDesc), starting with \(firstTwo).",
+                    "For \(dayDesc), you have \(count) \(count == 1 ? "meeting" : "meetings"): \(firstTwo).",
+                    "There \(count == 1 ? "is 1 meeting" : "are \(count) meetings") on your schedule \(dayDesc), including \(firstTwo)."
+                ]
+                return templates[seed % templates.count]
+            }
 
         case "get_weather":
-            guard json["error"] == nil else { return nil }
             let city = (json["city"] as? String) ?? "your city"
             let temp = extractLeadingInt(from: json["temperature"]) ?? (json["current_temp_c"] as? Int) ?? 25
             let condEn = ((json["condition"] as? String) ?? "clear").lowercased()
@@ -694,14 +891,105 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
             let rain = extractLeadingInt(from: json["rain_chance"]) ?? (json["rain_chance_percent"] as? Int) ?? 0
             switch language {
             case .hinglish:
-                return "\(city) mein abhi \(temp) degree aur \(condHi) hai, high \(high) degree, low \(low) degree, aur baarish ka chance \(rain) percent hai."
+                if rain >= 40 {
+                    let templates = [
+                        "\(city) mein \(condHi) hai, high \(high), low \(low) degrees, baarish \(rain) percent.",
+                        "Aaj \(city) mein \(condHi), high \(high), low \(low) degrees, baarish \(rain) percent.",
+                        "\(city) mein abhi \(condHi), high \(high), low \(low) degrees, rain \(rain) percent."
+                    ]
+                    return templates[seed % templates.count]
+                } else {
+                    let templates = [
+                        "\(city) mein abhi \(condHi) hai, high \(high) aur low \(low) degrees.",
+                        "Aaj \(city) mein \(condHi) hai, high \(high) aur low \(low) degrees.",
+                        "\(city) mein mausam \(condHi) hai, high \(high) aur low \(low) degrees."
+                    ]
+                    return templates[seed % templates.count]
+                }
             case .english:
-                return "In \(city), it is \(temp) degrees and \(condEn), with a high of \(high) degrees, low of \(low) degrees, and \(rain) percent chance of rain."
+                if rain >= 40 {
+                    let templates = [
+                        "In \(city), it is \(condEn) with a high of \(high), low of \(low), and \(rain) percent rain.",
+                        "\(city) is \(condEn) today, high \(high) and low \(low) degrees, with \(rain) percent rain chance.",
+                        "Today in \(city), expect \(condEn) skies, high \(high), low \(low) degrees, and \(rain) percent rain."
+                    ]
+                    return templates[seed % templates.count]
+                } else {
+                    let templates = [
+                        "In \(city), it is \(condEn) today with a high of \(high) and low of \(low) degrees.",
+                        "\(city) is \(condEn) today, with a high of \(high) degrees and low of \(low) degrees.",
+                        "Today in \(city), it is \(condEn) with a high of \(high) and low of \(low) degrees."
+                    ]
+                    return templates[seed % templates.count]
+                }
             }
 
         default:
             return nil
         }
+    }
+
+    private nonisolated static func formatCombinedScheduleAndNextMeeting(
+        scheduleJSON: [String: Any],
+        nextJSON: [String: Any],
+        language: VoiceAgentViewModel.Language,
+        turnSeed: Int,
+        now: Date
+    ) -> String? {
+        let count = (scheduleJSON["meeting_count"] as? Int) ?? 0
+        let meetings = (scheduleJSON["meetings"] as? [[String: Any]]) ?? []
+        let nextMeetingDict = (nextJSON["next_meeting"] as? [String: Any]) ?? meetings.first
+
+        switch language {
+        case .hinglish:
+            if count == 0 || meetings.isEmpty {
+                return "Aaj aapke schedule mein koi meeting nahi hai."
+            }
+            if let next = nextMeetingDict,
+               let title = next["title"] as? String {
+                let iso = next["start"] as? String
+                let spoken = (next["start_spoken"] as? String) ?? ""
+                let clock = friendlyHinglishClockOnly(fromISO: iso, spokenFallback: spoken)
+                let templates = [
+                    "Aaj aapki \(count) meetings hain, aur next meeting \(title) \(clock) hai.",
+                    "Aaj schedule mein \(count) meetings hain, agli meeting \(title) \(clock) hogi."
+                ]
+                return templates[abs(turnSeed) % templates.count]
+            }
+            return "Aaj aapke schedule mein \(count) meetings hain."
+        case .english:
+            if count == 0 || meetings.isEmpty {
+                return "You have no meetings scheduled for today."
+            }
+            if let next = nextMeetingDict,
+               let title = next["title"] as? String {
+                let iso = next["start"] as? String
+                let spoken = (next["start_spoken"] as? String) ?? ""
+                let clock = friendlyEnglishClockOnly(fromISO: iso, spokenFallback: spoken)
+                let templates = [
+                    "You have \(count) meetings today, and your next meeting is \(title) at \(clock).",
+                    "There are \(count) meetings on your schedule today, with \(title) up next at \(clock)."
+                ]
+                return templates[abs(turnSeed) % templates.count]
+            }
+            return "You have \(count) meetings scheduled for today."
+        }
+    }
+
+    /// Generates a deterministic spoken confirmation/summary from the last successful tool result when the LLM reply is empty or truncated (< 3 words).
+    public nonisolated static func deterministicToolFallbackReply(
+        executedTools: [LLMToolCall],
+        executedToolOutputs: [String],
+        language: VoiceAgentViewModel.Language,
+        now: Date = Date()
+    ) -> String? {
+        fastPathToolReply(
+            executedTools: executedTools,
+            executedToolOutputs: executedToolOutputs,
+            language: language,
+            turnSeed: 0,
+            now: now
+        )
     }
 
     private nonisolated static func extractLeadingInt(from anyValue: Any?) -> Int? {
@@ -713,16 +1001,56 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         return nil
     }
 
+    private nonisolated static func friendlyHinglishClockOnly(fromISO isoString: String?, spokenFallback: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        if let isoString, let date = formatter.date(from: isoString) {
+            let calendar = Calendar.current
+            let hour24 = calendar.component(.hour, from: date)
+            let minute = calendar.component(.minute, from: date)
+            let periodWord: String
+            if hour24 >= 4 && hour24 < 12 {
+                periodWord = "subah"
+            } else if hour24 >= 12 && hour24 < 17 {
+                periodWord = "dopahar"
+            } else if hour24 >= 17 && hour24 < 21 {
+                periodWord = "shaam"
+            } else {
+                periodWord = "raat"
+            }
+            let hour12 = (hour24 % 12 == 0) ? 12 : (hour24 % 12)
+            let timeStr = (minute == 0) ? "\(hour12) baje" : String(format: "%d:%02d baje", hour12, minute)
+            return "\(periodWord) \(timeStr)"
+        }
+        return spokenFallback.isEmpty ? "scheduled time" : spokenFallback
+    }
+
+    private nonisolated static func friendlyEnglishClockOnly(fromISO isoString: String?, spokenFallback: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        if let isoString, let date = formatter.date(from: isoString) {
+            let calendar = Calendar.current
+            let hour24 = calendar.component(.hour, from: date)
+            let minute = calendar.component(.minute, from: date)
+            let amPm = hour24 < 12 ? "AM" : "PM"
+            let hour12 = (hour24 % 12 == 0) ? 12 : (hour24 % 12)
+            return (minute == 0) ? "\(hour12) \(amPm)" : String(format: "%d:%02d %@", hour12, minute, amPm)
+        }
+        return spokenFallback.isEmpty ? "the scheduled time" : spokenFallback
+    }
+
     private nonisolated static func friendlyHinglishTimePhrase(fromISO isoString: String?, spokenFallback: String, now: Date) -> String {
         let formatter = ISO8601DateFormatter()
         if let isoString, let date = formatter.date(from: isoString) {
             let calendar = Calendar.current
+            let startOfToday = calendar.startOfDay(for: now)
             let dayWord: String
             if calendar.isDate(date, inSameDayAs: now) {
                 dayWord = "aaj"
-            } else if let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)),
+            } else if let tomorrow = calendar.date(byAdding: .day, value: 1, to: startOfToday),
                       calendar.isDate(date, inSameDayAs: tomorrow) {
                 dayWord = "kal"
+            } else if let dayAfter = calendar.date(byAdding: .day, value: 2, to: startOfToday),
+                      calendar.isDate(date, inSameDayAs: dayAfter) {
+                dayWord = "parso"
             } else {
                 let df = DateFormatter()
                 df.locale = Locale(identifier: "en_US_POSIX")
@@ -754,12 +1082,16 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
         let formatter = ISO8601DateFormatter()
         if let isoString, let date = formatter.date(from: isoString) {
             let calendar = Calendar.current
+            let startOfToday = calendar.startOfDay(for: now)
             let dayWord: String
             if calendar.isDate(date, inSameDayAs: now) {
                 dayWord = "today"
-            } else if let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)),
+            } else if let tomorrow = calendar.date(byAdding: .day, value: 1, to: startOfToday),
                       calendar.isDate(date, inSameDayAs: tomorrow) {
                 dayWord = "tomorrow"
+            } else if let dayAfter = calendar.date(byAdding: .day, value: 2, to: startOfToday),
+                      calendar.isDate(date, inSameDayAs: dayAfter) {
+                dayWord = "the day after tomorrow"
             } else {
                 let df = DateFormatter()
                 df.locale = Locale(identifier: "en_US_POSIX")
@@ -784,7 +1116,7 @@ nonisolated public final class AgentOrchestrator: LLMClient, Sendable {
     }
 }
 
-// MARK: - Thread-Safe First-Token & Sentence Streaming Hooks
+// MARK: - Thread-Safe First-Token & Sentence/Clause Streaming Hooks
 
 nonisolated private final class FirstTokenTracker: @unchecked Sendable {
     private let lock = NSLock()
@@ -823,59 +1155,221 @@ nonisolated private final class FirstTokenTracker: @unchecked Sendable {
     }
 }
 
-/// Buffers streamed LLM text deltas and emits complete sentences to `onSentenceReady` (Phase 6 sentence-level TTS streaming hook).
-nonisolated private final class SentenceStreamBuffer: @unchecked Sendable {
+/// Minimal locked buffer used by a provider's `@Sendable` stream callback.
+nonisolated private final class LockedTextBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = ""
+
+    func append(_ text: String) {
+        lock.lock()
+        storage += text
+        lock.unlock()
+    }
+
+    var value: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+/// Buffers streamed LLM text deltas and emits complete sentences or clauses (`3–4` words for Chunk 1, `>= 4` words at commas/clauses afterwards) to `onSentenceReady`.
+nonisolated internal final class SentenceStreamBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer: String = ""
+    private var emittedChunksCount: Int = 0
+    private let language: VoiceAgentViewModel.Language
     private let callback: (@Sendable (String) -> Void)?
 
-    init(callback: (@Sendable (String) -> Void)?) {
+    init(language: VoiceAgentViewModel.Language, callback: (@Sendable (String) -> Void)?) {
+        self.language = language
         self.callback = callback
+    }
+
+    static func splitText(_ text: String, language: VoiceAgentViewModel.Language) -> [String] {
+        var readyChunks: [String] = []
+        var buffer = text
+        var emittedChunksCount = 0
+        while let boundaryIndex = Self.firstClauseOrSentenceBoundary(
+            in: buffer,
+            allowEndOfBuffer: true,
+            isFirstChunk: (emittedChunksCount == 0)
+        ) {
+            let candidate = String(buffer[...boundaryIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            buffer = String(buffer[buffer.index(after: boundaryIndex)...])
+            let sanitized = AgentOrchestrator.sanitizeSpokenReply(candidate)
+            if !sanitized.isEmpty {
+                emittedChunksCount += 1
+                readyChunks.append(sanitized)
+            }
+        }
+        let remainder = AgentOrchestrator.sanitizeSpokenReply(buffer.trimmingCharacters(in: .whitespacesAndNewlines))
+        if !remainder.isEmpty {
+            readyChunks.append(remainder)
+        }
+        return readyChunks
+    }
+
+    var emittedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return emittedChunksCount
+    }
+
+    func resetUncommitted() {
+        lock.lock()
+        buffer = ""
+        lock.unlock()
+    }
+
+    func replaceBuffer(with text: String) {
+        lock.lock()
+        buffer = text
+        lock.unlock()
     }
 
     func append(_ delta: String) {
         guard let callback else { return }
-        var readySentences: [String] = []
+        var readyChunks: [String] = []
 
         lock.lock()
         buffer += delta
-        while let boundaryIndex = Self.firstSentenceBoundary(in: buffer) {
-            let sentence = String(buffer[...boundaryIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+        while let boundaryIndex = Self.firstClauseOrSentenceBoundary(
+            in: buffer,
+            allowEndOfBuffer: false,
+            isFirstChunk: (emittedChunksCount == 0)
+        ) {
+            let candidate = String(buffer[...boundaryIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            // In English mode, if the candidate contains Hinglish markers, hold back so the end-of-turn language guard can rewrite it cleanly
+            if language == .english && AgentOrchestrator.containsHinglishMarkers(candidate) {
+                break
+            }
             buffer = String(buffer[buffer.index(after: boundaryIndex)...])
-            if !sentence.isEmpty {
-                readySentences.append(sentence)
+            let sanitized = AgentOrchestrator.sanitizeSpokenReply(candidate)
+            if !sanitized.isEmpty {
+                emittedChunksCount += 1
+                readyChunks.append(sanitized)
             }
         }
         lock.unlock()
 
-        for sentence in readySentences {
-            callback(AgentOrchestrator.sanitizeSpokenReply(sentence))
+        for chunk in readyChunks {
+            callback(chunk)
         }
     }
 
     func flushRemaining() {
         guard let callback else { return }
-        let remainder: String
+        var readyChunks: [String] = []
+
         lock.lock()
-        remainder = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        while let boundaryIndex = Self.firstClauseOrSentenceBoundary(
+            in: buffer,
+            allowEndOfBuffer: true,
+            isFirstChunk: (emittedChunksCount == 0)
+        ) {
+            let candidate = String(buffer[...boundaryIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            buffer = String(buffer[buffer.index(after: boundaryIndex)...])
+            let sanitized = AgentOrchestrator.sanitizeSpokenReply(candidate)
+            if !sanitized.isEmpty {
+                emittedChunksCount += 1
+                readyChunks.append(sanitized)
+            }
+        }
+        let remainder = AgentOrchestrator.sanitizeSpokenReply(buffer.trimmingCharacters(in: .whitespacesAndNewlines))
         buffer = ""
+        if !remainder.isEmpty {
+            emittedChunksCount += 1
+            readyChunks.append(remainder)
+        }
         lock.unlock()
 
-        if !remainder.isEmpty {
-            callback(AgentOrchestrator.sanitizeSpokenReply(remainder))
+        for chunk in readyChunks {
+            callback(chunk)
         }
     }
 
-    private static func firstSentenceBoundary(in text: String) -> String.Index? {
-        let terminators: Set<Character> = [".", "!", "?", "।"]
+    /// Splits streamed text at:
+    /// 1. Sentence ends (`.`, `!`, `?`, `।`, `\n`) when followed by whitespace (ignoring decimal dots like `28.5`), or
+    /// 2. Commas/clause punctuation (`,`, `;`, `:`, `—`, `–`) followed by whitespace once the chunk has `>= 2` words (first chunk) or `>= 4` words (later chunks), or
+    /// 3. For the FIRST chunk (`isFirstChunk == true`), after `3–4` words if no punctuation boundary has occurred yet once `>= 5` words are in the buffer, avoiding splits right before Hindi postpositions.
+    private static func firstClauseOrSentenceBoundary(
+        in text: String,
+        allowEndOfBuffer: Bool = false,
+        isFirstChunk: Bool = false
+    ) -> String.Index? {
+        let sentenceTerminators: Set<Character> = [".", "!", "?", "।", "\n"]
+        let clauseDelimiters: Set<Character> = [",", ";", ":", "—", "–"]
+        let minClauseWords = isFirstChunk ? 2 : 4
+
+        var wordEndIndices: [String.Index] = []
+        var wordsLower: [String] = []
+        var currentWordStart: String.Index?
+
         for idx in text.indices {
-            if terminators.contains(text[idx]) {
-                let nextIdx = text.index(after: idx)
-                if nextIdx == text.endIndex || text[nextIdx].isWhitespace {
+            let ch = text[idx]
+            if ch.isWhitespace || ch.isNewline {
+                if let start = currentWordStart {
+                    let prevIdx = text.index(before: idx)
+                    wordEndIndices.append(prevIdx)
+                    let rawWord = String(text[start...prevIdx]).trimmingCharacters(in: .punctuationCharacters)
+                    wordsLower.append(rawWord.lowercased())
+                    currentWordStart = nil
+                }
+            } else if currentWordStart == nil {
+                currentWordStart = idx
+            }
+
+            let nextIdx = text.index(after: idx)
+            let isFollowedBySpace = (nextIdx < text.endIndex && text[nextIdx].isWhitespace) || (allowEndOfBuffer && nextIdx == text.endIndex)
+            guard isFollowedBySpace else { continue }
+
+            if sentenceTerminators.contains(ch) {
+                if ch == "." {
+                    // Ignore decimal points such as "28.5"
+                    if idx > text.startIndex {
+                        let prevIdx = text.index(before: idx)
+                        if text[prevIdx].isNumber, nextIdx < text.endIndex, text[nextIdx].isNumber {
+                            continue
+                        }
+                    }
+                }
+                let prefixWords = text[...idx].split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+                if prefixWords >= 1 {
+                    return idx
+                }
+            } else if clauseDelimiters.contains(ch) {
+                if ch == ":" && idx > text.startIndex {
+                    let prevIdx = text.index(before: idx)
+                    if text[prevIdx].isNumber {
+                        continue
+                    }
+                }
+                let prefixWords = text[...idx].split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+                if prefixWords >= minClauseWords {
                     return idx
                 }
             }
         }
+
+        if isFirstChunk && wordEndIndices.count >= 5 {
+            let hindiPostpositions: Set<String> = [
+                "mein", "par", "ko", "se", "ke", "ka", "ki", "ne", "tak", "bhi", "hi", "baje", "liye"
+            ]
+            let danglingWords: Set<String> = [
+                "the", "a", "an", "in", "on", "at", "to", "of", "for", "with", "by", "from", "aur", "and", "is", "are"
+            ]
+            var targetWordCount = 3
+            if wordsLower.count > targetWordCount, hindiPostpositions.contains(wordsLower[targetWordCount]) {
+                targetWordCount = 4
+            }
+            if targetWordCount == 3, danglingWords.contains(wordsLower[2]) {
+                targetWordCount = 4
+            }
+            let clamped = min(targetWordCount, wordEndIndices.count)
+            return wordEndIndices[clamped - 1]
+        }
+
         return nil
     }
 }
